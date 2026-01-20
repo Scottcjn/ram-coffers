@@ -129,6 +129,70 @@ static inline void dcbt_resident(const void* addr, size_t size) {
 }
 
 /*===========================================================================
+ * Layer-Ahead Prefetch Pipeline
+ *
+ * FIX: Don't prefetch everything at activation - that thrashes cache.
+ * Instead, prefetch layer N+1 while computing layer N.
+ * Thanks to ng @ NYSE for this optimization.
+ *===========================================================================*/
+
+typedef struct {
+    int current_layer;
+    int total_layers;
+    size_t layer_size;        /* Bytes per layer (approximate) */
+    const char* base_ptr;     /* Base of weight memory */
+} layer_prefetch_state_t;
+
+static layer_prefetch_state_t g_prefetch_state = {0};
+
+/* Initialize layer-ahead prefetch for a coffer */
+static inline void layer_prefetch_init(int coffer_id, int total_layers) {
+    if (coffer_id < 0 || coffer_id >= MAX_COFFERS) return;
+    ram_coffer_t* coffer = &g_coffers[coffer_id];
+    if (!coffer->is_loaded) return;
+
+    g_prefetch_state.current_layer = -1;
+    g_prefetch_state.total_layers = total_layers;
+    g_prefetch_state.layer_size = coffer->mmap_size / total_layers;
+    g_prefetch_state.base_ptr = (const char*)coffer->mmap_ptr;
+
+    /* Prefetch first layer only */
+    dcbt_resident(g_prefetch_state.base_ptr, g_prefetch_state.layer_size);
+}
+
+/*
+ * Call this BEFORE starting computation on layer N.
+ * It will prefetch layer N+1 while you compute N.
+ */
+static inline void layer_prefetch_ahead(int layer_id) {
+    if (layer_id < 0 || layer_id >= g_prefetch_state.total_layers) return;
+
+    g_prefetch_state.current_layer = layer_id;
+
+    /* Prefetch NEXT layer (layer_id + 1) if it exists */
+    int next_layer = layer_id + 1;
+    if (next_layer < g_prefetch_state.total_layers) {
+        const char* next_addr = g_prefetch_state.base_ptr +
+                                (next_layer * g_prefetch_state.layer_size);
+        size_t prefetch_size = g_prefetch_state.layer_size;
+
+        /* Use stream 1 for look-ahead (stream 0 may be in use) */
+        DCBT_STREAM_START(next_addr, 1);
+
+        const size_t cache_line = 128;
+        const char* p = next_addr;
+        const char* end = p + prefetch_size;
+
+        while (p < end) {
+            DCBT_PREFETCH(p);
+            p += cache_line * 8;
+        }
+
+        DCBT_STREAM_STOP(1);
+    }
+}
+
+/*===========================================================================
  * Resonance Routing
  *
  * Simple cosine similarity between query embedding and domain signatures.
@@ -246,6 +310,17 @@ static int coffer_load_shard(int coffer_id, const char* gguf_path) {
 
     /* mmap with huge pages if available */
     int mmap_flags = MAP_PRIVATE;
+
+#ifdef __linux__
+    /*
+     * FIX: Set memory policy BEFORE mmap to allocate on correct node.
+     * This avoids mbind(MPOL_MF_MOVE) which stalls on page migration.
+     * Thanks to ng @ NYSE for this optimization.
+     */
+    unsigned long nodemask = 1UL << coffer->numa_node;
+    set_mempolicy(MPOL_BIND, &nodemask, sizeof(nodemask) * 8);
+#endif
+
 #ifdef MAP_HUGETLB
     /* Try huge pages first, fall back to normal */
     coffer->mmap_ptr = mmap(NULL, coffer->mmap_size, PROT_READ,
@@ -259,18 +334,16 @@ static int coffer_load_shard(int coffer_id, const char* gguf_path) {
                             mmap_flags, coffer->fd, 0);
 #endif
 
+#ifdef __linux__
+    /* Reset to default policy for future allocations */
+    set_mempolicy(MPOL_DEFAULT, NULL, 0);
+#endif
+
     if (coffer->mmap_ptr == MAP_FAILED) {
         fprintf(stderr, "Coffers: mmap failed for %s\n", gguf_path);
         close(coffer->fd);
         return -1;
     }
-
-#ifdef __linux__
-    /* Migrate pages to target NUMA node */
-    unsigned long nodemask = 1UL << coffer->numa_node;
-    mbind(coffer->mmap_ptr, coffer->mmap_size, MPOL_BIND,
-          &nodemask, sizeof(nodemask) * 8, MPOL_MF_MOVE);
-#endif
 
     strncpy(coffer->gguf_path, gguf_path, sizeof(coffer->gguf_path) - 1);
     coffer->is_loaded = 1;
@@ -337,7 +410,12 @@ static void coffer_init_default_domains(void) {
  * Activate a coffer: bind CPU, prefetch weights, prepare for inference
  *===========================================================================*/
 
-static int activate_coffer(int coffer_id) {
+/*
+ * Activate coffer with optional layer count for pipelined prefetch.
+ * If n_layers > 0, uses layer-ahead prefetch (recommended).
+ * If n_layers <= 0, falls back to minimal prefetch (first 4MB only).
+ */
+static int activate_coffer_ex(int coffer_id, int n_layers) {
     if (coffer_id < 0 || coffer_id >= MAX_COFFERS) return -1;
 
     ram_coffer_t* coffer = &g_coffers[coffer_id];
@@ -348,18 +426,35 @@ static int activate_coffer(int coffer_id) {
     numa_run_on_node(coffer->numa_node);
 #endif
 
-    /* DCBT prefetch - stream first 64MB to cache */
-    size_t prefetch_size = coffer->mmap_size;
-    if (prefetch_size > 64 * 1024 * 1024) {
-        prefetch_size = 64 * 1024 * 1024;
+    if (n_layers > 0) {
+        /*
+         * Layer-ahead prefetch: Initialize pipeline, prefetch only layer 0.
+         * Subsequent layers prefetched via layer_prefetch_ahead().
+         */
+        layer_prefetch_init(coffer_id, n_layers);
+        coffer->prefetch_bytes += g_prefetch_state.layer_size;
+    } else {
+        /*
+         * Fallback: Minimal prefetch (first 4MB for headers/metadata).
+         * Avoid the old 64MB eager prefetch that thrashed cache.
+         */
+        size_t prefetch_size = 4 * 1024 * 1024;
+        if (prefetch_size > coffer->mmap_size) {
+            prefetch_size = coffer->mmap_size;
+        }
+        dcbt_resident(coffer->mmap_ptr, prefetch_size);
+        coffer->prefetch_bytes += prefetch_size;
     }
-    dcbt_resident(coffer->mmap_ptr, prefetch_size);
 
     coffer->is_active = 1;
     coffer->activations++;
-    coffer->prefetch_bytes += prefetch_size;
 
     return 0;
+}
+
+/* Backward-compatible wrapper */
+static int activate_coffer(int coffer_id) {
+    return activate_coffer_ex(coffer_id, 0);
 }
 
 /*===========================================================================

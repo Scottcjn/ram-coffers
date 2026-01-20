@@ -106,37 +106,52 @@ static inline vector float vec_perm_top4_of_8(
  * 2. vec_perm to mask below threshold
  *===========================================================================*/
 
+/*
+ * QuickSelect partition - O(n) average case
+ * Based on Hoare's selection algorithm (same as std::nth_element)
+ */
+static inline int partition_descending(float* arr, int lo, int hi) {
+    float pivot = arr[hi];
+    int i = lo - 1;
+    for (int j = lo; j < hi; j++) {
+        if (arr[j] >= pivot) {  /* Descending: >= for largest first */
+            i++;
+            float tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+        }
+    }
+    float tmp = arr[i + 1]; arr[i + 1] = arr[hi]; arr[hi] = tmp;
+    return i + 1;
+}
+
+/*
+ * QuickSelect: Find k-th largest in O(n) average case
+ * Much faster than O(20n) binary search - ng's suggestion
+ */
 static inline float find_kth_largest(
     const float* scores, int n, int k
 ) {
     if (k >= n) return -INFINITY;
     if (k <= 0) return INFINITY;
 
-    /* Quick histogram-based approximation */
-    float min_val = scores[0], max_val = scores[0];
-    for (int i = 1; i < n; i++) {
-        if (scores[i] < min_val) min_val = scores[i];
-        if (scores[i] > max_val) max_val = scores[i];
-    }
+    /* Work on a copy to avoid modifying original */
+    float* arr = (float*)__builtin_alloca(n * sizeof(float));
+    memcpy(arr, scores, n * sizeof(float));
 
-    if (max_val == min_val) return max_val;
+    int lo = 0, hi = n - 1;
+    int target = k - 1;  /* 0-indexed: k-th largest is at index k-1 */
 
-    /* Binary search for threshold */
-    float lo = min_val, hi = max_val;
-    for (int iter = 0; iter < 20; iter++) {
-        float mid = (lo + hi) * 0.5f;
-        int count = 0;
-        for (int i = 0; i < n; i++) {
-            if (scores[i] >= mid) count++;
-        }
-        if (count >= k) {
-            lo = mid;
+    while (lo < hi) {
+        int pivot_idx = partition_descending(arr, lo, hi);
+        if (pivot_idx == target) {
+            return arr[pivot_idx];
+        } else if (pivot_idx < target) {
+            lo = pivot_idx + 1;
         } else {
-            hi = mid;
+            hi = pivot_idx - 1;
         }
     }
 
-    return lo;
+    return arr[lo];
 }
 
 /*
