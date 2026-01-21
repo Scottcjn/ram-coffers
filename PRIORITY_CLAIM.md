@@ -37,10 +37,15 @@ This document establishes priority for the following innovations, all of which *
 **YouTube Upload: December 17, 2025**
 - URL: https://youtu.be/T_o39s7r0iE
 - Content: Loading DeepSeek 671B on IBM POWER8 S824
-- Visible: NUMA-aware memory distribution in llama.cpp frames
+- **Visible in frames: "NUMA Coffers" terminology**
+- Visible: PSE Vec_Perm Collapse Active, Top-K: 8, Amplify: 1.20, Entropy: MFTB
+- Visible: IBM MASS enabled, non-bijunctive transformation
 - Timestamp: Google-verified, immutable
+- Screenshot: `youtube-evidence-dec17-2025.png` included in this package
 
 This video was uploaded **26 days before** DeepSeek published their Engram paper.
+
+**The video explicitly shows "NUMA Coffers" - the exact architecture name - on December 17, 2025.**
 
 ---
 
