@@ -25,11 +25,22 @@ This document establishes priority for the following innovations, all of which *
 |------|------|----------|
 | **Oct 2024** | PowerLISP tetranary logic, procedural memory | `/home/scott/powerlisp/POWERLISP_HANDOFF.md` |
 | **Nov 2024** | Vec_perm non-bijunctive collapse research | `/home/scott/power8_vsx_permute_research.h` (Nov 21) |
-| **Dec 16, 2025** | RAM Coffers architecture | Zenodo submission, `/home/scott/zenodo-ram-coffers/` |
+| **Dec 16, 2025** | RAM Coffers architecture | Figshare DOI: 10.6084/m9.figshare.31093429 |
+| **Dec 17, 2025** | **VIDEO: NUMA-aware loading DeepSeek 671B** | **https://youtu.be/T_o39s7r0iE** ⭐ |
 | **Dec 16, 2025** | DCBT resident prefetch (147 t/s) | POWER8 benchmark logs |
 | **Jan 12, 2026** | DeepSeek "Engram" paper published | arXiv:2601.07372 |
 | **Jan 19, 2026** | GitHub publication | github.com/Scottcjn/ram-coffers |
 | **Jan 20, 2026** | Neuromorphic coffers | This implementation |
+
+### Video Evidence (CRITICAL)
+
+**YouTube Upload: December 17, 2025**
+- URL: https://youtu.be/T_o39s7r0iE
+- Content: Loading DeepSeek 671B on IBM POWER8 S824
+- Visible: NUMA-aware memory distribution in llama.cpp frames
+- Timestamp: Google-verified, immutable
+
+This video was uploaded **26 days before** DeepSeek published their Engram paper.
 
 ---
 

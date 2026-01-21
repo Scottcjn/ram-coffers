@@ -277,5 +277,19 @@ DeepSeek's Engram paper presents a valuable idea (separating static/dynamic comp
 
 *"They separate memory. We model cognition."*
 
+---
+
+## Video Evidence
+
+**YouTube: https://youtu.be/T_o39s7r0iE**
+- **Upload Date:** December 17, 2025 (Google-timestamped)
+- **Content:** Loading DeepSeek 671B on IBM POWER8 S824
+- **Shows:** NUMA-aware memory loading in llama.cpp frames
+- **Significance:** 26 days before DeepSeek Engram paper (Jan 12, 2026)
+
+This is not just code - it's **video proof** of the implementation working.
+
+---
+
 **Scott Boudreaux**
 Elyan Labs
