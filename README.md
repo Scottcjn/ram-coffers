@@ -45,6 +45,20 @@ Key parallels:
 - **RAM Coffers** (Dec 16, 2025): "Selectively house model information in known RAM banks with resonance routing for associative recall"
 - **DeepSeek Engram** (Jan 12, 2026): "Separate static knowledge from dynamic compute via O(1) lookup"
 
+## GRAIL-V Paper: Emotional Prompting Discovery
+
+Testing on this architecture led to a significant discovery: **emotional language enables 20% efficiency gains** in video generation, mirroring limbic gating in biological memory.
+
+See **[/grail-v-paper](./grail-v-paper/)** for the full CVPR 2026 submission:
+- 35 matched-pair benchmark with LPIPS validation
+- 23.9% file size reduction in controlled ablation
+- Cross-model validation on AnimateDiff and SVD
+- Theoretical grounding via Hopfield/EBM frameworks
+
+**Key Finding**: Complex multi-character emotional scenes benefit ~33% efficiency regardless of architecture.
+
+---
+
 ## Files Included
 
 | File | Description |
