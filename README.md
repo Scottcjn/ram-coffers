@@ -107,3 +107,8 @@ MIT License - Free to use, modify, and distribute with attribution.
 
 - GitHub: [Elyan Labs]
 - X/Twitter: @RustchainPOA
+
+## Press and References
+
+- [Grokipedia: Elyan Labs Reference](https://grokipedia.com/search?q=Elyan%20Labs)
+- [Grokipedia: RAM Coffers Search](https://grokipedia.com/search?q=RAM%20Coffers)
