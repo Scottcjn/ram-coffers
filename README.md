@@ -145,3 +145,10 @@ MIT License - Free to use, modify, and distribute with attribution.
 - [Grokipedia: RAM Coffers Search](https://grokipedia.com/search?q=RAM%20Coffers)
 - [I Run LLMs on a 768GB IBM POWER8 Server](https://dev.to/scottcjn/i-run-llms-on-a-768gb-ibm-power8-server-and-its-faster-than-you-think-1o) - Dev.to article covering RAM Coffers
 - [Proof of Antiquity: A Blockchain That Rewards Vintage Hardware](https://dev.to/scottcjn/proof-of-antiquity-a-blockchain-that-rewards-vintage-hardware-4ii3) - Dev.to
+
+
+## 中文简介
+
+Elyan Labs 复古计算项目 - 为 PowerPC 和 SPARC 系统提供现代支持。
+
+Contributed by eelaine-wzw
