@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+venv/
+env/
+.env
+
+# Build outputs
+*.o
+*.a
+*.so
+*.dylib
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test coverage
+htmlcov/
+.coverage
+coverage.xml
