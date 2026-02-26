@@ -136,8 +136,16 @@ MIT License - Free to use, modify, and distribute with attribution.
 
 ## Contact
 
-- GitHub: [Elyan Labs]
+- GitHub: [Scottcjn](https://github.com/Scottcjn)
 - X/Twitter: @RustchainPOA
+
+## Quick Start (Code Reading)
+
+This repository is header-focused; there is no single build script yet. A fast way to explore:
+
+1. Start from `ggml-ram-coffers.h` for the multi-bank routing path.
+2. Follow `ggml-coffer-mmap.h` for sharding/memory-mapping details.
+3. Read `power8-compat.h` + `ggml-topk-collapse-vsx.h` for ISA-specific optimizations.
 
 ## Press and References
 
