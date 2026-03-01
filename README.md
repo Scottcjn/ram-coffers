@@ -80,6 +80,18 @@ The elyan-prime MCP server that powers the persistent memory system used during 
 
 ---
 
+
+## New Reader Path (5-minute orientation)
+
+If this repository is new to you, start in this order:
+
+1. `ggml-ram-coffers.h` — high-level routing and coffer selection model
+2. `ggml-coffer-mmap.h` — memory mapping and NUMA shard placement
+3. `ggml-topk-collapse-vsx.h` — vectorized collapse path details
+4. `power8-compat.h` — ISA compatibility layer and portability constraints
+
+Suggested first goal: trace one inference request from coffer selection to collapse execution, then compare against the performance table.
+
 ## Files Included
 
 | File | Description |
