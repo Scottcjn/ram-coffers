@@ -172,3 +172,43 @@ This repository is header-focused; there is no single build script yet. A fast w
 - [I Run LLMs on a 768GB IBM POWER8 Server](https://dev.to/scottcjn/i-run-llms-on-a-768gb-ibm-power8-server-and-its-faster-than-you-think-1o) - Dev.to article covering RAM Coffers
 - [Proof of Antiquity: A Blockchain That Rewards Vintage Hardware](https://dev.to/scottcjn/proof-of-antiquity-a-blockchain-that-rewards-vintage-hardware-4ii3) - Dev.to
 - [Memory Scaffolding Shapes LLM Inference](https://dev.to/scottcjn/memory-scaffolding-shapes-llm-inference-how-persistent-context-changes-what-ai-builds-plj) - Dev.to article on persistent memory effects
+# RAM Coffers Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     RAM Coffers System                       │
+└─────────────────────────────────────────────────────────────┘
+
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│   Frontend   │─────▶│   Backend    │─────▶│   Database   │
+│  (Web UI)    │      │   (API)      │      │ (PostgreSQL) │
+└──────────────┘      └──────────────┘      └──────────────┘
+       │                     │                      │
+       │                     │                      │
+       ▼                     ▼                      ▼
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│   Browser    │      │   Server     │      │   Storage    │
+│   Cache      │      │   Cache      │      │   Layer      │
+└──────────────┘      └──────────────┘      └──────────────┘
+
+## Components
+
+### Frontend
+- React/Vue.js UI
+- Real-time updates
+- Responsive design
+
+### Backend
+- RESTful API
+- Authentication
+- Business logic
+
+### Database
+- PostgreSQL
+- Data persistence
+- Query optimization
+
+### Caching
+- Redis for session
+- Browser cache
+- CDN integration
