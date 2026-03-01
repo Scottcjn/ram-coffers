@@ -304,14 +304,29 @@ def quick_test(num_tests: int = 2, num_seeds: int = 2):
 
 if __name__ == "__main__":
     import sys
+    import argparse
 
-    if len(sys.argv) > 1 and sys.argv[1] == "quick":
+    parser = argparse.ArgumentParser(description="Neuromorphic Benchmark Suite for GRAIL-V paper")
+    parser.add_argument("mode", nargs="?", default="quick", choices=["quick", "full"],
+                        help="Run mode: quick (2 tests, 2 seeds) or full (all tests, 5 seeds)")
+    parser.add_argument("--markdown", action="store_true",
+                        help="Output results as markdown table for README copy-paste")
+
+    args = parser.parse_args()
+
+    if args.markdown:
+        print("\n## Benchmark Results\n")
+        print("| Test Name | Subject Type | Emotional Arc | Test Type | Steps | Seed | Queue Time (s) |")
+        print("|-----------|--------------|---------------|-----------|-------|------|----------------|")
+
+    if args.mode == "quick":
         quick_test(num_tests=2, num_seeds=2)
-    elif len(sys.argv) > 1 and sys.argv[1] == "full":
+    elif args.mode == "full":
         run_benchmark_suite(num_seeds=5)
     else:
         print("Usage:")
         print("  python neuromorphic_benchmark_suite.py quick  # 2 tests, 2 seeds each")
         print("  python neuromorphic_benchmark_suite.py full   # All tests, 5 seeds each")
+        print("  python neuromorphic_benchmark_suite.py quick --markdown  # Output as markdown table")
         print("\nRunning quick test by default...")
         quick_test(num_tests=2, num_seeds=2)
