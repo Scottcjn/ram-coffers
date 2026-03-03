@@ -117,6 +117,42 @@ On IBM POWER8 S824 with TinyLlama 1.1B Q4_K:
 
 **8.81x speedup** over stock on "obsolete" hardware.
 
+## Benchmark Harness (Contributor Starter)
+
+If you want to compare changes quickly, use this lightweight baseline procedure.
+
+### 1) Capture machine topology
+
+```bash
+lscpu
+numactl --hardware
+```
+
+### 2) Record a repeatable inference baseline
+
+Use one fixed prompt and one fixed model build so runs are comparable.
+
+```bash
+# Example shape only; adjust binary/model path to your local setup
+./main -m ./models/tinyllama-1.1b-q4_k.gguf -p "Explain NUMA routing in one paragraph" -n 128 -ngl 0
+```
+
+Record at minimum:
+- tokens/sec
+- prompt + generation lengths
+- active NUMA node affinity policy
+- whether collapse/prefetch code paths were enabled
+
+### 3) Compare before/after changes
+
+When opening a PR, include:
+- what changed
+- one baseline result
+- one post-change result
+- exact command used
+
+This keeps performance claims falsifiable and makes review much faster.
+
 ## License
 
 MIT License - Free to use, modify, and distribute with attribution.
