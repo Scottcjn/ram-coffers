@@ -80,7 +80,6 @@ The elyan-prime MCP server that powers the persistent memory system used during 
 
 ---
 
-
 ## New Reader Path (5-minute orientation)
 
 If this repository is new to you, start in this order:
@@ -88,9 +87,70 @@ If this repository is new to you, start in this order:
 1. `ggml-ram-coffers.h` — high-level routing and coffer selection model
 2. `ggml-coffer-mmap.h` — memory mapping and NUMA shard placement
 3. `ggml-topk-collapse-vsx.h` — vectorized collapse path details
-4. `power8-compat.h` — ISA compatibility layer and portability constraints
+4. `ggml-vcipher-collapse.h` — hardware AES alternative to vec_perm (NEW)
+5. `power8-compat.h` — ISA compatibility layer and portability constraints
 
 Suggested first goal: trace one inference request from coffer selection to collapse execution, then compare against the performance table.
+
+## vcipher: Hardware AES as Attention Collapse Primitive (NEW - March 2026)
+
+POWER8 ISA 2.07 includes `vcipher`/`vcipherlast` — hardware AES round instructions that execute SubBytes + ShiftRows + MixColumns + AddRoundKey in a **single cycle**. We repurpose these cryptographic primitives as attention collapse operators, providing capabilities impossible with `vec_perm` alone.
+
+### Why vcipher for Attention?
+
+| AES Stage | Attention Analogue | vec_perm equivalent |
+|-----------|-------------------|---------------------|
+| **SubBytes** | Non-linear score ranking (S-box) | Not possible — vec_perm is linear |
+| **ShiftRows** | Cross-position mixing | Requires multiple permutes |
+| **MixColumns** | Cross-head diffusion (GF(2^8) multiply) | **Impossible** — no finite field math |
+| **AddRoundKey** | Entropy injection (XOR with `mftb` timebase) | Separate step needed |
+
+### vcipher Prefilter for Flash Attention
+
+Two-pass approach applied to `ggml_compute_forward_flash_attn_ext_f16_one_chunk()`:
+
+1. **Pass 1 (O(1) per pair)**: `vcipher_attention_score()` — XOR first 16 bytes of Q and K, run through one AES round, sum output bytes. Cost: ~0.044µs per K-V pair.
+2. **Pass 2 (selective)**: Full `kq_vec_dot()` only for positions above threshold (top 25%). Skips 75% of expensive dot products.
+
+Breakeven at ~128 KV pairs. At 2048+ token contexts, saves 1,536+ full dot products per generated token.
+
+### Benchmark: vcipher vs vec_perm (POWER8 S824)
+
+```
+╔══════════════════════════════════════════════════════╗
+║  vec_perm collapse:       1.79 µs/iter              ║
+║  vcipher pattern gen:     0.016 µs/call  (112x)     ║
+║  Hybrid vcipher+vec_perm: 1.90 µs/iter              ║
+║  Pure vcipher attention:  0.044 µs/score             ║
+║  Cross-head fusion:       0.006 µs/fuse              ║
+╚══════════════════════════════════════════════════════╝
+```
+
+The `vcipher_attention_score()` at 0.044µs is **23-230x cheaper** than a full `kq_vec_dot()` on DK=128+ dimensions (1-10µs).
+
+### 4 Operating Modes
+
+```c
+// Mode 1: Non-linear permute pattern via AES rounds
+vector unsigned char pat = vcipher_generate_pattern(layer, pos, top_k);
+
+// Mode 2: Score ranking through SubBytes non-linearity
+vcipher_rank_scores(scores, n, layer, head);
+
+// Mode 3: Cross-head diffusion via MixColumns (IMPOSSIBLE with vec_perm)
+state = vcipher_fuse_heads(state, layer, head);
+
+// Mode 4: O(1) attention score — replaces Q·K dot product for prefiltering
+uint32_t score = vcipher_attention_score(Q, K, layer, position);
+```
+
+### Build
+
+```bash
+cmake .. -DCMAKE_C_FLAGS="-mcpu=power8 -mvsx -maltivec -mcrypto -DGGML_PSE_VCIPHER_PREFILTER"
+```
+
+Requires `-mcrypto` for `__builtin_crypto_vcipher()` / `__builtin_crypto_vcipherlast()`.
 
 ## Files Included
 
@@ -99,10 +159,16 @@ Suggested first goal: trace one inference request from coffer selection to colla
 | `ggml-ram-coffers.h` | Multi-bank NUMA weight indexing with resonance routing |
 | `ggml-coffer-mmap.h` | GGUF model sharding across NUMA nodes |
 | `ggml-ram-coffer.h` | Single coffer implementation |
-| `ggml-intelligent-collapse.h` | Hebbian-inspired non-bijunctive path collapse |
+| `ggml-intelligent-collapse.h` | Hebbian-inspired non-bijunctive path collapse (vec_perm) |
 | `ggml-topk-collapse-vsx.h` | VSX-optimized Top-K attention collapse |
+| **`ggml-vcipher-collapse.h`** | **Hardware AES crypto collapse — vcipher alternative to vec_perm** |
+| **`ggml-pse-integration.h`** | **Master PSE integration (v4.0.0-vcipher)** |
+| **`vcipher-flash-attn-patch.c`** | **Flash attention inner loop patch (ops.cpp reference)** |
+| **`bench_vcipher_collapse.c`** | **Benchmark: vcipher vs vec_perm collapse** |
 | `pse-entropy-burst.h` | Hardware entropy injection via PowerPC timebase |
 | `power8-compat.h` | POWER9→POWER8 intrinsic compatibility layer |
+| `ggml-neuromorphic-coffers.h` | Brain hemisphere → NUMA cognitive routing |
+| `ggml-symbolic-neural-bridge.h` | PowerLISP ↔ neural integration |
 
 ## Performance Results
 
@@ -112,10 +178,19 @@ On IBM POWER8 S824 with TinyLlama 1.1B Q4_K:
 |--------------|-------------------|
 | Stock llama.cpp | 16.74 |
 | + POWER8 VSX | 66.49 |
-| + PSE Collapse | 84.62 |
+| + PSE vec_perm Collapse | 84.62 |
 | + RAM Coffers + DCBT | **147.54** |
 
 **8.81x speedup** over stock on "obsolete" hardware.
+
+### GPT-OSS 120B (MXFP4, MoE 128 experts) — PSE v4.0.0-vcipher
+
+| Metric | Speed |
+|--------|-------|
+| Prompt eval | 13.7 t/s |
+| Generation | 6.0 t/s |
+
+Running on CPU-only POWER8 S824 with 512GB RAM. vcipher prefilter active for sequences >128 tokens.
 
 ## Benchmark Harness (Contributor Starter)
 
@@ -220,72 +295,11 @@ This repository is header-focused; there is no single build script yet. A fast w
 - [I Run LLMs on a 768GB IBM POWER8 Server](https://dev.to/scottcjn/i-run-llms-on-a-768gb-ibm-power8-server-and-its-faster-than-you-think-1o) - Dev.to article covering RAM Coffers
 - [Proof of Antiquity: A Blockchain That Rewards Vintage Hardware](https://dev.to/scottcjn/proof-of-antiquity-a-blockchain-that-rewards-vintage-hardware-4ii3) - Dev.to
 - [Memory Scaffolding Shapes LLM Inference](https://dev.to/scottcjn/memory-scaffolding-shapes-llm-inference-how-persistent-context-changes-what-ai-builds-plj) - Dev.to article on persistent memory effects
-# RAM Coffers Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     RAM Coffers System                       │
-└─────────────────────────────────────────────────────────────┘
-
-┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-│   Frontend   │─────▶│   Backend    │─────▶│   Database   │
-│  (Web UI)    │      │   (API)      │      │ (PostgreSQL) │
-└──────────────┘      └──────────────┘      └──────────────┘
-       │                     │                      │
-       │                     │                      │
-       ▼                     ▼                      ▼
-┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-│   Browser    │      │   Server     │      │   Storage    │
-│   Cache      │      │   Cache      │      │   Layer      │
-└──────────────┘      └──────────────┘      └──────────────┘
-
-## Components
-
-### Frontend
-- React/Vue.js UI
-- Real-time updates
-- Responsive design
-
-### Backend
-- RESTful API
-- Authentication
-- Business logic
-
-### Database
-- PostgreSQL
-- Data persistence
-- Query optimization
-
-### Caching
-- Redis for session
-- Browser cache
-- CDN integration
-
-## Additional Resources
-
-- **Full Paper**: [RAM Coffers on Zenodo](https://doi.org/10.5281/zenodo.18321905)
-- **BCOS Certification**: See [BCOS.md](BCOS.md) for certification details
-- **Contributing**: Read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines
-
----
-
-*RAM Coffers predates DeepSeek's Engram architecture by 27 days, establishing priority for NUMA-aware weight banking in LLM inference.*
 
 ---
 
 <div align="center">
 
-**[Elyan Labs](https://github.com/Scottcjn)** · 1,882 commits · 97 repos · 1,334 stars · $0 raised
-
-[⭐ Star Rustchain](https://github.com/Scottcjn/Rustchain) · [📊 Q1 2026 Traction Report](https://github.com/Scottcjn/Rustchain/blob/main/docs/DEVELOPER_TRACTION_Q1_2026.md) · [Follow @Scottcjn](https://github.com/Scottcjn)
+**[Elyan Labs](https://github.com/Scottcjn)** · [RustChain](https://rustchain.org) · [BoTTube](https://bottube.ai)
 
 </div>
-
-
----
-
-### Part of the Elyan Labs Ecosystem
-
-- [RustChain](https://rustchain.org) — Proof-of-Antiquity blockchain rewarding vintage hardware
-- [BoTTube](https://bottube.ai) — AI video platform where 119+ agents create content
-- [GitHub](https://github.com/Scottcjn)
