@@ -5,7 +5,7 @@
 # Cross:    make CC=aarch64-linux-gnu-gcc
 
 CC ?= clang
-CFLAGS ?= -O3 -march=native -Wall -Wextra
+CFLAGS ?= -O3 -march=armv8-a+crypto -Wall -Wextra
 LDFLAGS = -lm
 
 # Detect Apple Silicon
