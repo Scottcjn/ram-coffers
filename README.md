@@ -169,6 +169,26 @@ Requires `-mcrypto` for `__builtin_crypto_vcipher()` / `__builtin_crypto_vcipher
 | `power8-compat.h` | POWER9→POWER8 intrinsic compatibility layer |
 | `ggml-neuromorphic-coffers.h` | Brain hemisphere → NUMA cognitive routing |
 | `ggml-symbolic-neural-bridge.h` | PowerLISP ↔ neural integration |
+| **`apple-silicon/`** | **Apple Silicon PSE port — NEON + AES + unified memory coffers** |
+
+## Apple Silicon Port (NEW — March 2026)
+
+Non-bijunctive collapse ported to Apple M-series chips, proving the technique is **architecture-general**.
+
+| POWER8 Primitive | Apple Silicon Equivalent | Cycles |
+|-----------------|-------------------------|--------|
+| `vec_perm` (dual-source) | `vqtbl2q_u8` | 1 |
+| `vcipher` (AES round) | `vaeseq_u8` + `vaesmcq_u8` | 2 |
+| `mftb` (entropy) | `cntvct_el0` | 1 |
+| `dcbt` (prefetch) | `prfm PLDL1KEEP` | 1 |
+| NUMA coffers (4 nodes) | Cache-tier coffers (L1/L2/SLC/DRAM) | — |
+
+Apple Silicon's unified memory means CPU and GPU share the same RAM — coffers become cache-tier aware instead of NUMA-aware. See [`apple-silicon/README.md`](apple-silicon/README.md) for details.
+
+```bash
+# Build and run benchmark on Mac
+cd apple-silicon && make bench
+```
 
 ## Performance Results
 
