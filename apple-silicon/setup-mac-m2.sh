@@ -82,30 +82,50 @@ if [ ! -f ~/models/qwen2.5-7b-q4.gguf ]; then
     curl -L -o ~/models/qwen2.5-7b-q4.gguf \
         "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf"
 fi
-echo "Models ready in ~/models/"
 
-# ── Step 7: Run stock benchmark ───────────────────────
-echo ""
-echo "=== Step 7: Stock Benchmark ==="
-echo "--- TinyLlama 1.1B ---"
-./bin/llama-bench -m ~/models/tinyllama-1.1b-q4.gguf -t 4 -p 128 -n 32 2>&1 | tee ~/stock-bench.log
-
-if [ -f ~/models/qwen2.5-7b-q4.gguf ]; then
-    echo ""
-    echo "--- Qwen2.5 7B ---"
-    ./bin/llama-bench -m ~/models/qwen2.5-7b-q4.gguf -t 4 -p 128 -n 32 2>&1 | tee -a ~/stock-bench.log
+if [ ! -f ~/models/qwen3.5-9b-q4.gguf ]; then
+    echo "Downloading Qwen3.5 9B Q4_K_M (latest Qwen, fits in 24GB)..."
+    curl -L -o ~/models/qwen3.5-9b-q4.gguf \
+        "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"
 fi
 
-# ── Step 8: Divergence test ───────────────────────────
+if [ ! -f ~/models/qwen3.5-4b-q4.gguf ]; then
+    echo "Downloading Qwen3.5 4B Q4_K_M (fast, good for comparison)..."
+    curl -L -o ~/models/qwen3.5-4b-q4.gguf \
+        "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf"
+fi
+echo "Models ready in ~/models/"
+
+# ── Step 7: Run stock benchmark (all models) ──────────
 echo ""
-echo "=== Step 8: Divergence Test (stock — should be identical) ==="
-for i in 1 2 3; do
-    ./bin/llama-cli -m ~/models/tinyllama-1.1b-q4.gguf \
-        -p "The meaning of life is" -n 30 --seed 42 --temp 0.7 \
-        2>/dev/null > /tmp/stock_run_$i.txt
+echo "=== Step 7: Stock Benchmark ==="
+
+MODELS=(
+    "tinyllama-1.1b-q4.gguf|TinyLlama 1.1B"
+    "qwen3.5-4b-q4.gguf|Qwen3.5 4B"
+    "qwen2.5-7b-q4.gguf|Qwen2.5 7B"
+    "qwen3.5-9b-q4.gguf|Qwen3.5 9B"
+)
+
+> ~/stock-bench.log  # Clear log
+
+for entry in "${MODELS[@]}"; do
+    IFS='|' read -r fname label <<< "$entry"
+    if [ -f ~/models/$fname ]; then
+        echo ""
+        echo "--- $label ($fname) ---"
+        ./bin/llama-bench -m ~/models/$fname -t 4 -p 128 -n 32 2>&1 | tee -a ~/stock-bench.log
+        echo ""
+        echo "--- $label Divergence Test ---"
+        for i in 1 2 3; do
+            ./bin/llama-cli -m ~/models/$fname \
+                -p "The meaning of life is" -n 30 --seed 42 --temp 0.7 \
+                2>/dev/null > /tmp/stock_${fname}_run_$i.txt
+        done
+        echo "Stock $label MD5 (should be identical):"
+        md5 /tmp/stock_${fname}_run_*.txt 2>/dev/null || md5sum /tmp/stock_${fname}_run_*.txt
+    fi
 done
-echo "Stock runs MD5:"
-md5 /tmp/stock_run_*.txt 2>/dev/null || md5sum /tmp/stock_run_*.txt
 
 # ── Summary ───────────────────────────────────────────
 echo ""
