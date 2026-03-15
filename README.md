@@ -18,6 +18,7 @@
 | **Neuromorphic Prompt Translation** (GRAIL-V, emotional prompting) | [10.5281/zenodo.18623594](https://doi.org/10.5281/zenodo.18623594) | Feb 2026 |
 | **RustChain: One CPU, One Vote** (Proof of Antiquity consensus) | [10.5281/zenodo.18623592](https://doi.org/10.5281/zenodo.18623592) | Feb 2026 |
 | **Memory Scaffolding Shapes LLM Inference** (persistent context effects) | [10.5281/zenodo.18817988](https://doi.org/10.5281/zenodo.18817988) | Feb 2026 |
+| **Architecture-General Non-Bijunctive Hebbian Collapse** (POWER8 → Apple Silicon) | [10.5281/zenodo.19040847](https://doi.org/10.5281/zenodo.19040847) | Mar 2026 |
 
 ## Abstract
 
