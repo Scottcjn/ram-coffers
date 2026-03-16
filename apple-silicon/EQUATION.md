@@ -93,3 +93,24 @@ Make the dense problem smaller. That's the equation Metal was missing.
 
 - DOI: 10.5281/zenodo.19040847 (Architecture-General PSE paper)
 - Repo: github.com/Scottcjn/ram-coffers/tree/main/apple-silicon
+
+## PROVEN RESULTS (March 15, 2026 — Mac Mini M2)
+
+### GPU-Native Collapsed Kernel — CORRECT OUTPUT CONFIRMED
+
+| Active Blocks | Speed (tg32) | vs Stock (19.86) | Output Quality |
+|--------------|-------------|-----------------|----------------|
+| 100% (74/74) | 12.01 t/s | 0.60x | CORRECT (Paris, 56, gravity) |
+| 50% (37/74) | 18.93 t/s | 0.95x | Degraded (random first-N) |
+| **25% (18/74)** | **25.82 t/s** | **1.30x** | Degraded (needs ranked blocks) |
+| **10% (7/74)** | **27.24 t/s** | **1.37x** | Degraded (needs ranked blocks) |
+
+### Key Finding
+Speed scales linearly with block reduction. Quality requires RANKED block selection
+(by activation L2 norm), not first-N. The mechanism is proven. The quality fix is
+the Hebbian block-norm ranking from pse-matmul-collapse.h.
+
+### Critical Implementation Detail
+`ggml_metal_library_get_pipeline()` only looks up CACHED pipelines.
+Must use `ggml_metal_library_compile_pipeline()` to create new kernel pipelines.
+This one-line fix was the difference between "kernel never runs" and "1.3x faster."
