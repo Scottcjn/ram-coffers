@@ -136,3 +136,40 @@ This one-line fix was the difference between "kernel never runs" and "1.3x faste
 Uniform pruning across all 28 layers DESTROYS quality (even at 90%).
 Selective pruning (protect early/late, prune middle) PRESERVES quality even at 60%.
 The model has massive redundancy in middle FFN layers but almost none at the edges.
+
+## STOCK KERNEL + REDUCED K — THE WINNING APPROACH (March 16, 2026)
+
+Don't write custom kernels. Feed the stock kernel less work.
+
+### Results (stock kernel, ne00 reduced, Qwen2.5-7B)
+| K | Speed (tg32) | vs Stock | Quality |
+|---|-------------|----------|---------|
+| 100% | 19.84 t/s | 1.00x | Perfect |
+| **90%** | **21.47 t/s** | **1.08x** | **All correct** |
+| 80% | 22.56 t/s | 1.14x | Math degrades |
+| 75% | 23.39 t/s | 1.18x | Repetition |
+| 50% | 28.16 t/s | 1.42x | Garbage |
+| 25% | 35.46 t/s | 1.79x | Garbage |
+
+### Implementation: 4 lines in ggml-metal-ops.cpp
+```cpp
+} else if (op->src[0]->type == GGML_TYPE_Q4_K && ne11 == 1) {
+    int pse_ne00 = (ne00 * 90 / 100 / 256) * 256;  // 90% K, block-aligned
+    // ... use stock pipeline with pse_ne00 instead of ne00 ...
+}
+```
+
+### Why Custom Kernel Failed (0.6x stock)
+- Indirect block_ids[] killed GPU prefetch
+- Missing Metal function constants
+- Fighting Apple's own kernel optimization
+
+### Why Stock Kernel Works (1.08x with reduced K)
+- Sequential access pattern preserved
+- Full function constant optimization
+- Apple's kernel at full speed, just less data
+
+### Next: Physical Block Compaction
+Currently using first 90% of blocks (truncation). With a Metal compute
+kernel that copies the BEST 90% blocks (by activation L2 norm) to the
+front of the buffer, we could push to 85% K with maintained quality → 1.12x.
