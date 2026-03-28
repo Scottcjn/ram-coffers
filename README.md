@@ -249,6 +249,21 @@ When opening a PR, include:
 
 This keeps performance claims falsifiable and makes review much faster.
 
+### 4) Use the reproducible harness
+
+For contributors who want a one-command baseline scaffold, run:
+
+```bash
+./benchmark_harness.sh
+```
+
+This generates:
+- machine topology snapshot
+- environment/toolchain snapshot
+- markdown benchmark report in `benchmarks/out/`
+
+On unsupported non-POWER8 hosts, the harness still produces reproducible metadata and a fallback report instead of failing silently.
+
 ## License
 
 MIT License - Free to use, modify, and distribute with attribution.
