@@ -1,6 +1,12 @@
 # RAM Coffers: NUMA-Distributed Conditional Memory for LLM Inference
 
+> **Part of the [Proof of Physical AI](https://github.com/Scottcjn/Rustchain) stack** — where real hardware earns real tokens.
+
+[![Proof of Physical AI](https://img.shields.io/badge/Proof_of_Physical_AI-POWER8-blue?style=flat-square)](https://github.com/Scottcjn/Rustchain)
 [![BCOS Certified](https://img.shields.io/badge/BCOS-Certified-brightgreen?style=flat&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0xMiAxTDMgNXY2YzAgNS41NSAzLjg0IDEwLjc0IDkgMTIgNS4xNi0xLjI2IDktNi40NSA5LTEyVjVsLTktNHptLTIgMTZsLTQtNCA1LjQxLTUuNDEgMS40MSAxLjQxTDEwIDE0bDYtNiAxLjQxIDEuNDFMMTAgMTd6Ii8+PC9zdmc+)](BCOS.md)
+
+**147 tokens/sec on POWER8 — 8.8x stock llama.cpp.** The same IBM POWER8 hardware that runs RAM Coffers inference also mines RTC via [Proof of Antiquity](https://github.com/Scottcjn/Rustchain), making this a DePIN node that does useful AI work while earning rewards for its physical existence.
+
 **Author:** Scott Boudreaux
 **Date:** December 16, 2025
 **Institution:** Elyan Labs (Independent Research)
@@ -323,6 +329,19 @@ This repository is header-focused; there is no single build script yet. A fast w
 1. Start from `ggml-ram-coffers.h` for the multi-bank routing path.
 2. Follow `ggml-coffer-mmap.h` for sharding/memory-mapping details.
 3. Read `power8-compat.h` + `ggml-topk-collapse-vsx.h` for ISA-specific optimizations.
+
+## The Proof of Physical AI Stack
+
+RAM Coffers is part of a vertically integrated DePIN system where **the hardware that runs inference also earns tokens**:
+
+| Layer | Project | What It Does |
+|-------|---------|-------------|
+| **Memory** | **RAM Coffers** (this repo) | NUMA-distributed weight banking, resonance routing |
+| **Inference** | [llama-cpp-power8](https://github.com/Scottcjn/llama-cpp-power8) | vec_perm collapse, PSE entropy, DCBT prefetch |
+| **Consensus** | [RustChain](https://github.com/Scottcjn/Rustchain) | Proof of Antiquity — 1 CPU = 1 Vote, vintage hardware earns more |
+| **DePIN** | [RustChain Network](https://rustchain.org) | 4 attestation nodes, hardware fingerprinting, RTC token rewards |
+
+The same POWER8 S824 that hits 147 t/s with RAM Coffers also mines RTC via Proof of Antiquity. Real hardware doing real AI work, earning real tokens. No cloud. No API landlords. No rented cognition.
 
 ## Press and References
 
