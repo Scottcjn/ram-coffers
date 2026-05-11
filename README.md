@@ -82,7 +82,7 @@ See **[/grail-v-paper](./grail-v-paper/)** for the full CVPR 2026 submission:
 
 The elyan-prime MCP server that powers the persistent memory system used during development of RAM Coffers is itself the subject of research. The paper **"Memory Scaffolding Shapes LLM Inference"** ([DOI 10.5281/zenodo.18817988](https://doi.org/10.5281/zenodo.18817988)) demonstrates that persistent context (600+ memories) fundamentally changes how an LLM architects solutions — the iterative compounding that produced RAM Coffers is a direct example of this effect.
 
-- Repository: [Scottcjn/elyan-prime](https://github.com/Scottcjn/elyan-prime)
+- Project: elyan-prime MCP server
 - Article: [Dev.to — Memory Scaffolding Shapes LLM Inference](https://dev.to/scottcjn/memory-scaffolding-shapes-llm-inference-how-persistent-context-changes-what-ai-builds-plj)
 
 ---
