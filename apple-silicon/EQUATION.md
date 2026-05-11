@@ -92,7 +92,7 @@ Make the dense problem smaller. That's the equation Metal was missing.
 ## References
 
 - DOI: 10.5281/zenodo.19040847 (Architecture-General PSE paper)
-- Repo: github.com/Scottcjn/ram-coffers/tree/main/apple-silicon
+- Repo: https://github.com/Scottcjn/ram-coffers/tree/main/apple-silicon
 
 ## PROVEN RESULTS (March 15, 2026 — Mac Mini M2)
 
