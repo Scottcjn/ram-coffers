@@ -385,7 +385,7 @@ The NPT includes:
 - **Grammar validator**: Ensures single emotional focus per subject
 - **Arc templates**: Pre-built emotional trajectories for common scenarios
 
-Code available at: `github.com/Scottcjn/ram-coffers`
+Code available at: [github.com/Scottcjn/ram-coffers](https://github.com/Scottcjn/ram-coffers)
 
 ---
 
@@ -801,6 +801,6 @@ the air thick with intellectual rivalry
 
 ---
 
-*This work was conducted at Elyan Labs. Code, data, and video outputs available at: github.com/Scottcjn/ram-coffers*
+*This work was conducted at Elyan Labs. Code, data, and video outputs available at: [github.com/Scottcjn/ram-coffers](https://github.com/Scottcjn/ram-coffers)*
 
 *Priority claim: This work predates DeepSeek Engram (arXiv:2601.07372, Jan 12, 2026) by 27+ days. See PRIORITY_CLAIM.md for documentation.*

@@ -29,7 +29,7 @@ This document establishes priority for the following innovations, all of which *
 | **Dec 17, 2025** | **VIDEO: NUMA-aware loading DeepSeek 671B** | **https://youtu.be/T_o39s7r0iE** ⭐ |
 | **Dec 16, 2025** | DCBT resident prefetch (147 t/s) | POWER8 benchmark logs |
 | **Jan 12, 2026** | DeepSeek "Engram" paper published | arXiv:2601.07372 |
-| **Jan 19, 2026** | GitHub publication | github.com/Scottcjn/ram-coffers |
+| **Jan 19, 2026** | GitHub publication | [github.com/Scottcjn/ram-coffers](https://github.com/Scottcjn/ram-coffers) |
 | **Jan 20, 2026** | Neuromorphic coffers | This implementation |
 
 ### Video Evidence (CRITICAL)
