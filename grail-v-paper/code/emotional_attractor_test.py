@@ -6,10 +6,35 @@ Tests the hypothesis that emotional vocabulary forms deeper attractor wells
 in Hopfield-like associative memory, explaining faster convergence.
 """
 
-import torch
-import torch.nn.functional as F
+from __future__ import annotations
+
 import numpy as np
 from typing import List, Tuple
+
+try:
+    import torch
+    import torch.nn.functional as F
+except ImportError as exc:
+    torch = None
+    F = None
+    _TORCH_IMPORT_ERROR = exc
+else:
+    _TORCH_IMPORT_ERROR = None
+
+
+def _require_torch() -> None:
+    if _TORCH_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "emotional_attractor_test.py requires the optional 'torch' "
+            "dependency. Install PyTorch to run this paper analysis."
+        ) from _TORCH_IMPORT_ERROR
+
+
+def test_optional_torch_dependency_available():
+    """Document that this paper analysis is skipped unless PyTorch is installed."""
+    import pytest
+
+    pytest.importorskip("torch")
 
 # Simulated embeddings based on CLIP/Gemma semantic space
 # Emotional words cluster more tightly (16% as shown in paper)
@@ -37,6 +62,7 @@ def generate_clustered_embeddings(vocab: List[str], dim: int = 128,
     Lower cluster_tightness = tighter clusters (emotional vocab)
     Higher cluster_tightness = looser clusters (literal vocab)
     """
+    _require_torch()
     n = len(vocab)
 
     # Generate base cluster centers (semantic categories)
@@ -66,6 +92,7 @@ def hopfield_energy(state: torch.Tensor, patterns: torch.Tensor, beta: float = 1
 
     Lower energy = deeper attractor well
     """
+    _require_torch()
     # Normalize
     state = F.normalize(state.unsqueeze(0), dim=1).squeeze()
     patterns = F.normalize(patterns, dim=1)
@@ -84,6 +111,7 @@ def measure_attractor_depth(embeddings: torch.Tensor, beta: float = 16.0) -> Tup
 
     Returns (avg_energy, avg_convergence_steps)
     """
+    _require_torch()
     n = len(embeddings)
     energies = []
     convergence_steps = []
@@ -133,6 +161,7 @@ def measure_attractor_depth(embeddings: torch.Tensor, beta: float = 16.0) -> Tup
 
 
 def main():
+    _require_torch()
     # Set seed for reproducibility
     torch.manual_seed(42)
     np.random.seed(42)
@@ -232,4 +261,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
