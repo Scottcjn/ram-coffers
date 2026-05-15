@@ -37,36 +37,38 @@ def detect_numa_linux() -> Optional[Dict]:
 def _parse_numactl_output(output: str) -> Dict:
     """Parse numactl --hardware output."""
     nodes = {}
-    current_node = None
-    
+
     for line in output.split('\n'):
         line = line.strip()
-        if line.startswith('node'):
-            parts = line.split()
-            node_id = int(parts[0].split(' ')[-1].rstrip(':'))
-            current_node = node_id
-            nodes[node_id] = {
+        parts = line.split()
+        if len(parts) < 3 or parts[0] != 'node' or not parts[1].isdigit():
+            continue
+
+        node_id = int(parts[1])
+        field = parts[2].rstrip(':')
+        nodes.setdefault(
+            node_id,
+            {
                 'cpus': [],
                 'size_mb': 0,
                 'free_mb': 0,
-            }
-        elif line.startswith('cpus:') and current_node is not None:
+            },
+        )
+
+        if field == 'cpus':
             # Parse CPU list: "0 1 2 3 4 5 6 7" or "0-7"
-            cpu_str = line.split(':', 1)[1].strip()
             cpus = []
-            for part in cpu_str.split():
+            for part in parts[3:]:
                 if '-' in part:
                     start, end = part.split('-')
                     cpus.extend(range(int(start), int(end) + 1))
                 else:
                     cpus.append(int(part))
-            nodes[current_node]['cpus'] = cpus
-        elif line.startswith('size:') and current_node is not None:
-            parts = line.split()
-            nodes[current_node]['size_mb'] = int(parts[1])
-        elif line.startswith('free:') and current_node is not None:
-            parts = line.split()
-            nodes[current_node]['free_mb'] = int(parts[1])
+            nodes[node_id]['cpus'] = cpus
+        elif field == 'size' and len(parts) >= 4:
+            nodes[node_id]['size_mb'] = int(parts[3])
+        elif field == 'free' and len(parts) >= 4:
+            nodes[node_id]['free_mb'] = int(parts[3])
     
     return {
         'system': 'linux',
