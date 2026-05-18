@@ -99,6 +99,8 @@ If this repository is new to you, start in this order:
 
 Suggested first goal: trace one inference request from coffer selection to collapse execution, then compare against the performance table.
 
+For common onboarding questions about RAM Coffers, RTC, and Proof of Antiquity, see [FAQ.md](FAQ.md).
+
 ## vcipher: Hardware AES as Attention Collapse Primitive (NEW - March 2026)
 
 POWER8 ISA 2.07 includes `vcipher`/`vcipherlast` — hardware AES round instructions that execute SubBytes + ShiftRows + MixColumns + AddRoundKey in a **single cycle**. We repurpose these cryptographic primitives as attention collapse operators, providing capabilities impossible with `vec_perm` alone.
