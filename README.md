@@ -274,7 +274,7 @@ On unsupported non-POWER8 hosts, the harness still produces reproducible metadat
 
 ## License
 
-MIT License - Free to use, modify, and distribute with attribution.
+Apache License 2.0 - see [LICENSE](LICENSE) for the full terms.
 
 ## Citation
 
