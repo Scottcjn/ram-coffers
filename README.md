@@ -272,6 +272,18 @@ This generates:
 
 On unsupported non-POWER8 hosts, the harness still produces reproducible metadata and a fallback report instead of failing silently.
 
+For a direct stock llama.cpp vs RAM Coffers comparison matching the bounty shape
+from issue #45, run:
+
+```bash
+./benchmark_coffers_vs_llamacpp.sh
+```
+
+The script downloads TinyLlama Q4, runs `llama-bench` with `pp128` and `tg32`,
+and writes a markdown comparison table to `benchmarks/out/`. Use `--stock-bin`
+and `--coffers-bin` to point at existing POWER8 builds when you already have a
+hand-patched llama.cpp tree.
+
 ## License
 
 Apache License 2.0 - see [LICENSE](LICENSE) for the full terms.

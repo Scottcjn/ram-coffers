@@ -12,6 +12,8 @@ env/
 build/
 dist/
 *.egg-info/
+.bench/
+benchmarks/out/
 
 # IDE
 .vscode/
