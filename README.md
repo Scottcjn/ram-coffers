@@ -272,6 +272,22 @@ This generates:
 
 On unsupported non-POWER8 hosts, the harness still produces reproducible metadata and a fallback report instead of failing silently.
 
+For a direct stock llama.cpp vs RAM Coffers comparison matching the bounty shape
+from issue #45, run:
+
+```bash
+./benchmark_coffers_vs_llamacpp.sh \
+  --coffers-bin /opt/llama.cpp-coffers/build/bin/llama-bench \
+  --coffers-commit "$(git -C /opt/llama.cpp-coffers rev-parse HEAD)"
+```
+
+The script downloads TinyLlama Q4, runs `llama-bench` with `pp128` and `tg32`,
+and writes a markdown comparison table to `benchmarks/out/`. It can build the
+stock llama.cpp binary, but it does not synthesize a RAM Coffers binary from
+headers alone. Use `--coffers-bin` and `--coffers-commit` to point at an
+existing verified POWER8 build, and add `--stock-bin` / `--stock-commit` when
+you also want to use an external stock build.
+
 ## License
 
 Apache License 2.0 - see [LICENSE](LICENSE) for the full terms.
