@@ -42,12 +42,19 @@ It is especially useful because this repository targets specialized POWER8 hardw
 For the #45 bounty workflow, use the dedicated comparison harness:
 
 ```bash
-./benchmark_coffers_vs_llamacpp.sh
+./benchmark_coffers_vs_llamacpp.sh \
+  --coffers-bin /opt/llama.cpp-coffers/build/bin/llama-bench \
+  --coffers-commit "$(git -C /opt/llama.cpp-coffers rev-parse HEAD)"
 ```
 
-It downloads TinyLlama Q4, prepares stock and RAM Coffers llama.cpp benchmark
-binaries when not supplied, runs `llama-bench` with `pp128` and `tg32`, and
-writes a markdown table to `benchmarks/out/`.
+It downloads TinyLlama Q4, prepares the stock llama.cpp benchmark binary when
+not supplied, runs `llama-bench` with `pp128` and `tg32`, and writes a markdown
+table to `benchmarks/out/`.
+
+The harness intentionally refuses to build a synthetic RAM Coffers binary from
+copied headers alone. Pass `--coffers-bin` for a verified hand-patched
+llama.cpp build and `--coffers-commit` for the exact source commit used to build
+it.
 
 On a POWER8 host with an existing hand-patched llama.cpp tree, pass the exact
 binaries explicitly:
@@ -55,7 +62,9 @@ binaries explicitly:
 ```bash
 ./benchmark_coffers_vs_llamacpp.sh \
   --stock-bin /opt/llama.cpp-stock/build/bin/llama-bench \
-  --coffers-bin /opt/llama.cpp-coffers/build/bin/llama-bench
+  --stock-commit "$(git -C /opt/llama.cpp-stock rev-parse HEAD)" \
+  --coffers-bin /opt/llama.cpp-coffers/build/bin/llama-bench \
+  --coffers-commit "$(git -C /opt/llama.cpp-coffers rev-parse HEAD)"
 ```
 
 For CI or review on non-Linux hosts, inspect the generated command/report shape:

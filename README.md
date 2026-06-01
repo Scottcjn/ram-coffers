@@ -276,13 +276,17 @@ For a direct stock llama.cpp vs RAM Coffers comparison matching the bounty shape
 from issue #45, run:
 
 ```bash
-./benchmark_coffers_vs_llamacpp.sh
+./benchmark_coffers_vs_llamacpp.sh \
+  --coffers-bin /opt/llama.cpp-coffers/build/bin/llama-bench \
+  --coffers-commit "$(git -C /opt/llama.cpp-coffers rev-parse HEAD)"
 ```
 
 The script downloads TinyLlama Q4, runs `llama-bench` with `pp128` and `tg32`,
-and writes a markdown comparison table to `benchmarks/out/`. Use `--stock-bin`
-and `--coffers-bin` to point at existing POWER8 builds when you already have a
-hand-patched llama.cpp tree.
+and writes a markdown comparison table to `benchmarks/out/`. It can build the
+stock llama.cpp binary, but it does not synthesize a RAM Coffers binary from
+headers alone. Use `--coffers-bin` and `--coffers-commit` to point at an
+existing verified POWER8 build, and add `--stock-bin` / `--stock-commit` when
+you also want to use an external stock build.
 
 ## License
 

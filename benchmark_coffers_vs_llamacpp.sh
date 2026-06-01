@@ -14,6 +14,8 @@ RUNS="${RUNS:-3}"
 STOCK_NUMA_NODE="${STOCK_NUMA_NODE:-0}"
 STOCK_BIN="${STOCK_BIN:-}"
 COFFERS_BIN="${COFFERS_BIN:-}"
+STOCK_LLAMA_COMMIT="${STOCK_LLAMA_COMMIT:-}"
+COFFERS_LLAMA_COMMIT="${COFFERS_LLAMA_COMMIT:-}"
 DRY_RUN=false
 SETUP_ONLY=false
 ALLOW_SINGLE_NUMA=false
@@ -31,6 +33,8 @@ Options:
   --allow-single-numa    Permit execution on one-NUMA-node Linux for smoke testing.
   --stock-bin PATH       Use an existing stock llama-bench binary.
   --coffers-bin PATH     Use an existing RAM Coffers llama-bench binary.
+  --stock-commit SHA     Record the stock llama.cpp source commit.
+  --coffers-commit SHA   Record the RAM Coffers llama.cpp source commit.
   --model PATH           Use an existing GGUF model path.
   --threads N            Override benchmark thread count.
   --help                 Show this help text.
@@ -42,6 +46,8 @@ Environment:
   MODEL_URL              TinyLlama Q4 GGUF URL to download.
   RUNS                   llama-bench repetitions, default: 3.
   STOCK_NUMA_NODE        NUMA node for stock run, default: 0.
+  STOCK_LLAMA_COMMIT     Stock llama.cpp source commit for external binaries.
+  COFFERS_LLAMA_COMMIT   RAM Coffers llama.cpp source commit for external binaries.
   JOBS                   Build parallelism, default: detected CPU count.
 EOF
 }
@@ -63,6 +69,14 @@ while [ "$#" -gt 0 ]; do
       ;;
     --coffers-bin)
       COFFERS_BIN="${2:?missing path for --coffers-bin}"
+      shift
+      ;;
+    --stock-commit)
+      STOCK_LLAMA_COMMIT="${2:?missing SHA for --stock-commit}"
+      shift
+      ;;
+    --coffers-commit)
+      COFFERS_LLAMA_COMMIT="${2:?missing SHA for --coffers-commit}"
       shift
       ;;
     --model)
@@ -125,6 +139,8 @@ capture_environment() {
     echo "- Threads: ${THREADS}"
     echo "- Runs: ${RUNS}"
     echo "- llama.cpp ref: ${LLAMA_CPP_REF}"
+    echo "- Stock llama.cpp commit: ${STOCK_LLAMA_COMMIT:-not yet resolved}"
+    echo "- RAM Coffers llama.cpp commit: ${COFFERS_LLAMA_COMMIT:-not yet resolved}"
     echo "- Model: ${MODEL_PATH}"
     echo
     echo "## Tooling"
@@ -187,15 +203,6 @@ clone_llamacpp() {
   fi
 }
 
-copy_coffers_headers() {
-  local dest="$1"
-  local arch_dir="${dest}/ggml/src/ggml-cpu/arch/powerpc"
-  mkdir -p "$arch_dir"
-  cp "${ROOT_DIR}/ggml-ram-coffers.h" "$arch_dir/"
-  cp "${ROOT_DIR}/ggml-coffer-mmap.h" "$arch_dir/"
-  cp "${ROOT_DIR}/ggml-neuromorphic-coffers.h" "$arch_dir/"
-}
-
 build_llamacpp() {
   local src="$1"
   local build_dir="$2"
@@ -223,32 +230,64 @@ find_llama_bench() {
   exit 1
 }
 
+validate_executable() {
+  local label="$1"
+  local path="$2"
+  if [ -z "$path" ]; then
+    echo "Missing ${label} path" >&2
+    exit 1
+  fi
+  if [ ! -x "$path" ]; then
+    echo "${label} is not executable: ${path}" >&2
+    exit 1
+  fi
+}
+
+infer_binary_git_commit() {
+  local bin="$1"
+  local dir
+  dir="$(cd "$(dirname "$bin")" 2>/dev/null && pwd)" || return 1
+  git -C "$dir" rev-parse --show-toplevel >/dev/null 2>&1 || return 1
+  git -C "$dir" rev-parse HEAD
+}
+
+require_commit_metadata() {
+  local label="$1"
+  local value="$2"
+  local option="$3"
+  if [ -z "$value" ]; then
+    echo "Missing ${label} source commit; pass ${option} or set the matching environment variable." >&2
+    exit 1
+  fi
+}
+
 prepare_binaries() {
   local stock_src="${BENCH_ROOT}/llama.cpp-stock"
-  local coffers_src="${BENCH_ROOT}/llama.cpp-coffers"
   local stock_build="${stock_src}/build-stock"
-  local coffers_build="${coffers_src}/build-coffers"
-  local arch
-  arch="$(uname -m)"
 
   if [ -z "$STOCK_BIN" ]; then
     clone_llamacpp "$stock_src"
+    STOCK_LLAMA_COMMIT="$(git -C "$stock_src" rev-parse HEAD)"
     build_llamacpp "$stock_src" "$stock_build"
     STOCK_BIN="$(find_llama_bench "$stock_build")"
+  elif [ -z "$STOCK_LLAMA_COMMIT" ]; then
+    validate_executable "stock llama-bench" "$STOCK_BIN"
+    STOCK_LLAMA_COMMIT="$(infer_binary_git_commit "$STOCK_BIN" || true)"
   fi
 
   if [ -z "$COFFERS_BIN" ]; then
-    clone_llamacpp "$coffers_src"
-    copy_coffers_headers "$coffers_src"
-    if [[ "$arch" == ppc64* || "$arch" == powerpc* ]]; then
-      build_llamacpp "$coffers_src" "$coffers_build" \
-        -DCMAKE_C_FLAGS="-mcpu=power8 -mvsx -maltivec -O3" \
-        -DCMAKE_CXX_FLAGS="-mcpu=power8 -mvsx -maltivec -O3"
-    else
-      build_llamacpp "$coffers_src" "$coffers_build"
-    fi
-    COFFERS_BIN="$(find_llama_bench "$coffers_build")"
+    write_report "" "" "" "" "RAM Coffers execution binary was not supplied. This harness refuses to synthesize a fake Coffers build; pass --coffers-bin and --coffers-commit for a verified hand-patched llama.cpp binary."
+    echo "Missing --coffers-bin; generated refusal report: ${REPORT_FILE}" >&2
+    exit 1
+  elif [ -z "$COFFERS_LLAMA_COMMIT" ]; then
+    validate_executable "RAM Coffers llama-bench" "$COFFERS_BIN"
+    COFFERS_LLAMA_COMMIT="$(infer_binary_git_commit "$COFFERS_BIN" || true)"
   fi
+
+  validate_executable "stock llama-bench" "$STOCK_BIN"
+  validate_executable "RAM Coffers llama-bench" "$COFFERS_BIN"
+  require_commit_metadata "stock llama.cpp" "$STOCK_LLAMA_COMMIT" "--stock-commit"
+  require_commit_metadata "RAM Coffers llama.cpp" "$COFFERS_LLAMA_COMMIT" "--coffers-commit"
 }
 
 run_bench() {
@@ -307,6 +346,10 @@ write_report() {
     echo "- Test shape: pp128 / tg32"
     echo "- Threads: ${THREADS}"
     echo "- Runs: ${RUNS}"
+    echo "- Stock binary: ${STOCK_BIN:-not supplied}"
+    echo "- Stock llama.cpp commit: ${STOCK_LLAMA_COMMIT:-not supplied}"
+    echo "- RAM Coffers binary: ${COFFERS_BIN:-not supplied}"
+    echo "- RAM Coffers llama.cpp commit: ${COFFERS_LLAMA_COMMIT:-not supplied}"
     echo "- Topology: $(basename "$TOPOLOGY_FILE")"
     echo "- Environment: $(basename "$ENV_FILE")"
     echo
@@ -329,8 +372,8 @@ write_report() {
     echo "## Notes"
     echo
     echo "- The stock run pins CPU and memory allocation to one NUMA node."
-    echo "- The RAM Coffers run follows the repository quick-start policy by using the Coffers build and interleaving memory across all NUMA nodes."
-    echo "- Existing builds can be supplied with --stock-bin and --coffers-bin when testing a hand-patched POWER8 llama.cpp tree."
+    echo "- The RAM Coffers run requires a verified hand-patched llama.cpp binary supplied with --coffers-bin."
+    echo "- This harness records source commits for both variants and refuses to build a synthetic Coffers binary from copied headers alone."
   } > "$REPORT_FILE"
 }
 
@@ -354,6 +397,12 @@ nodes="$(node_count)"
 if [ "${nodes:-0}" -lt 2 ] && [ "$ALLOW_SINGLE_NUMA" != true ]; then
   write_report "" "" "" "" "Host has ${nodes:-0} NUMA node(s); pass --allow-single-numa for smoke tests, or run on multi-NUMA Linux for bounty-grade numbers."
   echo "Generated single-NUMA guard report: ${REPORT_FILE}"
+  exit 1
+fi
+
+if [ -z "$COFFERS_BIN" ]; then
+  write_report "" "" "" "" "RAM Coffers execution binary was not supplied. This harness refuses to synthesize a fake Coffers build; pass --coffers-bin and --coffers-commit for a verified hand-patched llama.cpp binary."
+  echo "Missing --coffers-bin; generated refusal report: ${REPORT_FILE}" >&2
   exit 1
 fi
 
