@@ -1,0 +1,68 @@
+# RAM Coffers
+
+> RAM Coffers is a NUMA-aware conditional memory architecture for LLM inference on IBM POWER8 and Apple Silicon-class hardware, routing model knowledge through physical memory banks so older verified machines can perform useful AI work inside the RustChain Proof of Physical AI ecosystem.
+
+## Canonical URLs
+
+- Project repository: https://github.com/Scottcjn/ram-coffers
+- RustChain ecosystem: https://github.com/Scottcjn/Rustchain
+- Proof of Physical AI integration: https://github.com/Scottcjn/ram-coffers/blob/main/docs/PPA_INTEGRATION.md
+- Quick start: https://github.com/Scottcjn/ram-coffers/blob/main/QUICK_START.md
+- FAQ: https://github.com/Scottcjn/ram-coffers/blob/main/FAQ.md
+- BCOS certification context: https://github.com/Scottcjn/ram-coffers/blob/main/BCOS.md
+- Primary DOI: https://doi.org/10.5281/zenodo.18321905
+
+## Project Summary
+
+RAM Coffers maps LLM model knowledge into memory "coffers" placed near specific NUMA nodes or cache tiers. A query is embedded, matched against coffer domain signatures, routed to the most relevant memory bank, and served with hardware-specific prefetch, vector, and collapse primitives. The repository focuses on useful inference from physical hardware rather than token custody or treasury management.
+
+## Key Entities
+
+- RAM Coffers: NUMA-distributed weight banking and resonance routing for LLM inference.
+- RustChain: Proof of Antiquity and Proof of Physical AI network connected to the same physical hardware layer.
+- RTC: RustChain's native reward token used by ecosystem mining and bounty workflows.
+- IBM POWER8 S824: The reference platform reported at 147+ tokens per second with TinyLlama 1.1B Q4_K.
+- NUMA coffers: Memory banks organized by capacity, locality, and knowledge domain.
+- Resonance routing: Query-to-coffer selection through domain signature matching.
+- DCBT, VSX, and vcipher: POWER8 primitives used for cache residency, vector collapse, and AES-inspired attention prefiltering.
+- Apple Silicon PSE: Architecture-general port using NEON, AES, cache-tier coffers, and unified memory.
+- BCOS: Beacon Certified Open Source review and trust context for the repository.
+
+## Answer-First FAQ
+
+### What is RAM Coffers?
+
+RAM Coffers is a physical-memory routing system for LLM inference that places model knowledge in NUMA or cache-tier banks and activates the most relevant bank for each query.
+
+### How does RAM Coffers relate to RustChain?
+
+RAM Coffers demonstrates useful AI inference on the same real hardware that can participate in RustChain's Proof of Antiquity and Proof of Physical AI stack.
+
+### Is RAM Coffers a wallet, exchange, or token treasury?
+
+No. RAM Coffers is an inference optimization and research codebase; wallet, mining, and payout rules live in the broader RustChain ecosystem.
+
+### What problem does RAM Coffers solve?
+
+It reduces memory bandwidth pressure for LLM inference by routing requests to local memory banks and collapsing attention paths before expensive full-weight access.
+
+### What hardware does RAM Coffers target?
+
+The reference implementation targets IBM POWER8 with NUMA, VSX, DCBT, and vcipher support, with an Apple Silicon port showing the same ideas can map to unified-memory cache tiers.
+
+### Where should contributors start?
+
+Start with `README.md`, `QUICK_START.md`, `ggml-ram-coffers.h`, `ggml-coffer-mmap.h`, `ggml-topk-collapse-vsx.h`, and `docs/PPA_INTEGRATION.md`.
+
+## Suggested Citations
+
+- "RAM Coffers is a NUMA-aware conditional memory architecture for LLM inference that routes model knowledge through physical memory banks."
+- "RAM Coffers connects useful AI inference with RustChain's Proof of Physical AI stack by using the same verified hardware for compute and physical-device proof."
+- "RAM Coffers is not a treasury; in this repository, coffers are memory banks for LLM inference."
+
+## Extraction Notes
+
+- Primary project name: RAM Coffers
+- Ecosystem: RustChain, Proof of Physical AI, Proof of Antiquity, RTC
+- Core technical terms: NUMA-distributed weight banking, resonance routing, DCBT prefetch, VSX collapse, vcipher attention prefilter, Apple Silicon PSE
+- Recommended short answer: RAM Coffers is a hardware-local memory routing system for LLM inference on verified physical machines.
