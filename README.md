@@ -236,6 +236,41 @@ On IBM POWER8 S824 with TinyLlama 1.1B Q4_K:
 
 **8.81x speedup** over stock on "obsolete" hardware.
 
+### Reproducing the 147.54 t/s POWER8 Claim
+
+Use the dedicated comparison harness when you want to validate the headline
+TinyLlama result against a stock llama.cpp baseline. The documented comparison
+uses:
+
+- Hardware: IBM POWER8 S824, CPU-only, multi-NUMA Linux host.
+- Model: TinyLlama 1.1B Q4 GGUF, downloaded by `benchmark_coffers_vs_llamacpp.sh`
+  unless `--model` points to an existing local file.
+- Benchmark shape: `llama-bench` prompt processing `pp128` and generation `tg32`.
+- Repetitions: `RUNS=3` by default.
+- Threading: pass `--threads 64` for the documented POWER8 optimum, or record
+  the override you used in the generated report.
+- NUMA policy: stock llama.cpp is pinned to one NUMA node with
+  `STOCK_NUMA_NODE=0` by default; RAM Coffers uses `numactl --interleave=all`
+  with an existing verified RAM Coffers llama.cpp binary.
+
+On the POWER8 host, provide exact binary paths and source commits for both
+variants so reviewers can reproduce the same comparison:
+
+```bash
+./benchmark_coffers_vs_llamacpp.sh \
+  --threads 64 \
+  --stock-bin /opt/llama.cpp-stock/build/bin/llama-bench \
+  --stock-commit "$(git -C /opt/llama.cpp-stock rev-parse HEAD)" \
+  --coffers-bin /opt/llama.cpp-coffers/build/bin/llama-bench \
+  --coffers-commit "$(git -C /opt/llama.cpp-coffers rev-parse HEAD)"
+```
+
+The harness writes the environment snapshot, topology snapshot, raw logs, and a
+markdown comparison table to `benchmarks/out/`. Compare the generated `pp128`
+row against the README table above; do not report new headline numbers unless
+they come from a POWER8 run with the command, commits, model path, and raw logs
+attached.
+
 ### GPT-OSS 120B (MXFP4, MoE 128 experts) — PSE v4.0.0-vcipher
 
 | Metric | Speed |
