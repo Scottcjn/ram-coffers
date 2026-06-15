@@ -6,8 +6,9 @@ Displays NUMA node layout, CPU assignment, memory distribution,
 and weight allocation for LLM inference optimization.
 
 Usage:
-    python3 ram_coffers_topology.py          # Text output
-    python3 ram_coffers_topology.py --json   # JSON output
+    python3 ram_coffers_topology.py                 # Text output
+    python3 ram_coffers_topology.py --json          # JSON output
+    python3 ram_coffers_topology.py --plan --model ./model.gguf
 """
 
 import os
@@ -211,6 +212,48 @@ def calculate_weights(topology: Dict) -> Dict[int, float]:
     return weights
 
 
+def build_placement_plan(
+    topology: Dict,
+    weights: Dict[int, float],
+    model_path: Optional[str] = None,
+) -> Dict:
+    """Build a dry-run NUMA placement plan for model weights."""
+    model_size_mb = None
+    fallback_reason = None
+
+    if model_path:
+        if os.path.exists(model_path):
+            model_size_mb = os.path.getsize(model_path) / (1024 * 1024)
+        else:
+            fallback_reason = f"model path not found: {model_path}"
+    elif topology.get('num_nodes', 1) <= 1:
+        fallback_reason = "single NUMA node detected"
+
+    planned_nodes = {}
+    for node_id, info in topology['nodes'].items():
+        weight_percent = weights.get(node_id, 0.0)
+        shard_mb = None
+        if model_size_mb is not None:
+            shard_mb = model_size_mb * (weight_percent / 100.0)
+
+        planned_nodes[str(node_id)] = {
+            'cpus': info.get('cpus', []),
+            'available_memory_mb': info.get('free_mb', 0),
+            'total_memory_mb': info.get('size_mb', 0),
+            'weight_percent': weight_percent,
+            'planned_shard_mb': shard_mb,
+        }
+
+    return {
+        'mode': 'dry-run',
+        'model_path': model_path,
+        'model_size_mb': model_size_mb,
+        'num_nodes': topology.get('num_nodes', len(topology['nodes'])),
+        'fallback_reason': fallback_reason,
+        'nodes': planned_nodes,
+    }
+
+
 def display_topology_text(topology: Dict, weights: Dict[int, float]) -> None:
     """Display NUMA topology as text tree."""
     print(f"\n{'='*60}")
@@ -243,6 +286,31 @@ def display_topology_text(topology: Dict, weights: Dict[int, float]) -> None:
         else:
             print(f"└── Status: ✓ Balanced")
     
+    print()
+
+
+def display_plan_text(plan: Dict) -> None:
+    """Display dry-run NUMA placement plan as text."""
+    print(f"\n{'='*60}")
+    print("  Dry-run NUMA Placement Plan")
+    print(f"{'='*60}\n")
+
+    if plan.get('model_path'):
+        print(f"Model: {plan['model_path']}")
+    if plan.get('model_size_mb') is not None:
+        print(f"Model size: {plan['model_size_mb']:.1f} MB")
+    if plan.get('fallback_reason'):
+        print(f"Fallback: {plan['fallback_reason']}")
+
+    for node_id, info in sorted(plan['nodes'].items(), key=lambda item: int(item[0])):
+        shard = info.get('planned_shard_mb')
+        shard_text = f"{shard:.1f} MB" if shard is not None else "unknown"
+        print(
+            f"Node {node_id}: weight {info['weight_percent']:.1f}% | "
+            f"planned shard {shard_text} | "
+            f"free {info['available_memory_mb']} MB"
+        )
+
     print()
 
 
@@ -279,6 +347,15 @@ def main():
         action='store_true',
         help='Output in JSON format'
     )
+    parser.add_argument(
+        '--plan',
+        action='store_true',
+        help='Print a dry-run NUMA weight placement plan'
+    )
+    parser.add_argument(
+        '--model',
+        help='Optional model path used to estimate planned shard sizes'
+    )
     
     args = parser.parse_args()
     
@@ -287,12 +364,19 @@ def main():
     
     # Calculate weights
     weights = calculate_weights(topology)
-    
+    plan = build_placement_plan(topology, weights, args.model) if args.plan else None
+
     # Display
     if args.json:
-        display_topology_json(topology, weights)
+        if plan:
+            print(json.dumps(plan, indent=2))
+        else:
+            display_topology_json(topology, weights)
     else:
-        display_topology_text(topology, weights)
+        if plan:
+            display_plan_text(plan)
+        else:
+            display_topology_text(topology, weights)
 
 
 if __name__ == '__main__':
