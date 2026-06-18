@@ -249,6 +249,27 @@ Running on CPU-only POWER8 S824 with 512GB RAM. vcipher prefilter active for seq
 
 If you want to compare changes quickly, use this lightweight baseline procedure.
 
+### Reproducing the POWER8 headline result
+
+The headline table above should be treated as a `pp128` prompt-eval throughput
+comparison on an IBM POWER8 S824-class host. When reproducing or extending it,
+record the following contract next to the result so reviewers can compare runs:
+
+| Field | Reproducible value to report |
+|---|---|
+| Model | TinyLlama 1.1B Chat GGUF, Q4_K_M quantization (`tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf`) |
+| Benchmark binary | `llama-bench` from stock llama.cpp and a separately built RAM Coffers-patched llama.cpp tree |
+| Benchmark shape | `pp128` for prompt-eval throughput and `tg32` for decode throughput |
+| Repetitions | `RUNS=3` by default in `benchmark_coffers_vs_llamacpp.sh` |
+| Stock placement | single NUMA node, `STOCK_NUMA_NODE=0` unless otherwise stated |
+| RAM Coffers placement | interleaved / coffer-aware placement across available POWER8 NUMA nodes |
+| Compiler flags to record | llama.cpp commit, CMake options, compiler version, and POWER8 flags such as `-mcpu=power8`, `-mvsx`, `-maltivec`, and `-mcrypto` when used by the patched build |
+| Output metric | prompt-eval tokens/sec for `pp128`; decode tokens/sec for `tg32`; do not mix the two in one headline |
+
+The 147.54 t/s number is a prompt-eval (`pp128`) result, not a mixed
+prompt-plus-generation average. Decode throughput should be reported separately
+with the `tg32` row from `llama-bench`.
+
 ### 1) Capture machine topology
 
 ```bash
@@ -311,6 +332,12 @@ stock llama.cpp binary, but it does not synthesize a RAM Coffers binary from
 headers alone. Use `--coffers-bin` and `--coffers-commit` to point at an
 existing verified POWER8 build, and add `--stock-bin` / `--stock-commit` when
 you also want to use an external stock build.
+
+For claim-quality benchmark reports, include the generated topology file, the
+environment file, the exact stock and RAM Coffers commits, the model URL/path,
+`RUNS`, `THREADS`, `STOCK_NUMA_NODE`, and whether `--allow-single-numa` was used
+only for smoke testing. Single-NUMA or non-POWER8 runs are correctness/shape
+checks and should not be presented as POWER8 performance reproductions.
 
 ## License
 
