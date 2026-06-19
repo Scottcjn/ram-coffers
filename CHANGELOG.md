@@ -63,7 +63,7 @@ The scientific peak of the project so far. Three independent AI reviews (Claude,
 Project graduated from solo lab notebook to public-contributor project. This is the release IBM evaluators expect for "production-readable open source."
 
 ### Added
-- **BCOS certification** — Blockchain Certified Open Source v1 attestation; v2 live verification added 2026-03-21 (`BCOS.md`).
+- **BCOS certification** — Beacon Certified Open Source v1 attestation; v2 live verification added 2026-03-21 (`BCOS.md`).
 - **`SECURITY.md`** — Coordinated-disclosure policy and safe-harbor language (2026-02-19, finalized 2026-03-01 as `#18`).
 - **`CODE_OF_CONDUCT.md`** — Contributor Covenant 3.0.
 - **`CONTRIBUTING.md`** (`#28`) — Build instructions, NUMA test setup, PR conventions.
