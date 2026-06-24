@@ -5,7 +5,7 @@ RAM Coffers is a NUMA-aware conditional memory architecture for LLM inference th
 > **Part of the [Proof of Physical AI](https://github.com/Scottcjn/Rustchain) stack** — where real hardware earns real tokens.
 
 [![Proof of Physical AI](https://img.shields.io/badge/Proof_of_Physical_AI-POWER8-blue?style=flat-square)](https://github.com/Scottcjn/Rustchain)
-[![BCOS Certified](https://img.shields.io/badge/BCOS-Certified-brightgreen?style=flat&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0xMiAxTDMgNXY2YzAgNS41NSAzLjg0IDEwLjc0IDkgMTIgNS4xNi0xLjI2IDktNi40NSA5LTEyVjVsLTktNHptLTIgMTZsLTQtNCA1LjQxLTUuNDEgMS40MSAxLjQxTDEwIDE0bDYtNiAxLjQxIDEuNDFMMTAgMTd6Ii8+PC9zdmc+)](BCOS.md)
+[![BCOS Certified](https://img.shields.io/badge/BCOS-Certified-brightgreen?style=flat&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0xMiAxTDMgNXY2YzAgNS41NSAzLjg0IDEwLjc0IDkgMTIgNS4xNi0xLjI2IDktNi40NSA5LTEyVjVsLTktNHptLTIgMTZsLTQtNCA1LjQxLTUuNDEgMS40MSAxLjQxTDEwIDE0bDYtNiAxLjQxIDEuNDFMMTAgMTd6Ii8+PC9zdmc+)](BCOS.md) [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](LICENSE)
 
 **147 tokens/sec on POWER8 — 8.8x stock llama.cpp.** The same IBM POWER8 hardware that runs RAM Coffers inference also mines RTC via [Proof of Antiquity](https://github.com/Scottcjn/Rustchain), making this a DePIN node that does useful AI work while earning rewards for its physical existence.
 
@@ -314,7 +314,7 @@ you also want to use an external stock build.
 
 ## License
 
-Apache License 2.0 - see [LICENSE](LICENSE) for the full terms.
+GNU AGPL v3.0 - see [LICENSE](LICENSE) for the full terms.
 
 ## Citation
 
