@@ -9,6 +9,8 @@ RAM Coffers is a NUMA-aware conditional memory architecture for LLM inference th
 
 **147 tokens/sec on POWER8 — 8.8x stock llama.cpp.** The same IBM POWER8 hardware that runs RAM Coffers inference also mines RTC via [Proof of Antiquity](https://github.com/Scottcjn/Rustchain), making this a DePIN node that does useful AI work while earning rewards for its physical existence.
 
+See **[BENCHMARK.md](BENCHMARK.md)** for exactly what was measured, what's still template/unreproduced, and the commands to run this yourself.
+
 **Author:** Scott Boudreaux
 **Date:** December 16, 2025
 **Institution:** Elyan Labs (Independent Research)
@@ -238,23 +240,11 @@ On IBM POWER8 S824 with TinyLlama 1.1B Q4_K:
 
 ### Reproducing the 147.54 t/s POWER8 Claim
 
-Use the dedicated comparison harness when you want to validate the headline
-TinyLlama result against a stock llama.cpp baseline. The documented comparison
-uses:
-
-- Hardware: IBM POWER8 S824, CPU-only, multi-NUMA Linux host.
-- Model: TinyLlama 1.1B Q4 GGUF, downloaded by `benchmark_coffers_vs_llamacpp.sh`
-  unless `--model` points to an existing local file.
-- Benchmark shape: `llama-bench` prompt processing `pp128` and generation `tg32`.
-- Repetitions: `RUNS=3` by default.
-- Threading: pass `--threads 64` for the documented POWER8 optimum, or record
-  the override you used in the generated report.
-- NUMA policy: stock llama.cpp is pinned to one NUMA node with
-  `STOCK_NUMA_NODE=0` by default; RAM Coffers uses `numactl --interleave=all`
-  with an existing verified RAM Coffers llama.cpp binary.
-
-On the POWER8 host, provide exact binary paths and source commits for both
-variants so reviewers can reproduce the same comparison:
+Full detail (measured numbers vs. reproduction template, hardware
+inconsistencies in this README, build gaps) lives in **[BENCHMARK.md](BENCHMARK.md)**.
+Short version: use `benchmark_coffers_vs_llamacpp.sh` with `--threads 64` and
+explicit `--stock-bin`/`--coffers-bin` plus their source commits, on an actual
+POWER8 host with a real hand-patched RAM Coffers `llama.cpp` build:
 
 ```bash
 ./benchmark_coffers_vs_llamacpp.sh \
@@ -265,11 +255,9 @@ variants so reviewers can reproduce the same comparison:
   --coffers-commit "$(git -C /opt/llama.cpp-coffers rev-parse HEAD)"
 ```
 
-The harness writes the environment snapshot, topology snapshot, raw logs, and a
-markdown comparison table to `benchmarks/out/`. Compare the generated `pp128`
-row against the README table above; do not report new headline numbers unless
-they come from a POWER8 run with the command, commits, model path, and raw logs
-attached.
+Compare the generated `pp128` row to the README table above. Don't report a
+new headline number without the command, commits, model path, and raw logs
+attached; see BENCHMARK.md for the full reporting checklist.
 
 ### GPT-OSS 120B (MXFP4, MoE 128 experts) — PSE v4.0.0-vcipher
 
@@ -286,24 +274,12 @@ If you want to compare changes quickly, use this lightweight baseline procedure.
 
 ### Reproducing the POWER8 headline result
 
-The headline table above should be treated as a `pp128` prompt-eval throughput
-comparison on an IBM POWER8 S824-class host. When reproducing or extending it,
-record the following contract next to the result so reviewers can compare runs:
-
-| Field | Reproducible value to report |
-|---|---|
-| Model | TinyLlama 1.1B Chat GGUF, Q4_K_M quantization (`tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf`) |
-| Benchmark binary | `llama-bench` from stock llama.cpp and a separately built RAM Coffers-patched llama.cpp tree |
-| Benchmark shape | `pp128` for prompt-eval throughput and `tg32` for decode throughput |
-| Repetitions | `RUNS=3` by default in `benchmark_coffers_vs_llamacpp.sh` |
-| Stock placement | single NUMA node, `STOCK_NUMA_NODE=0` unless otherwise stated |
-| RAM Coffers placement | interleaved / coffer-aware placement across available POWER8 NUMA nodes |
-| Compiler flags to record | llama.cpp commit, CMake options, compiler version, and POWER8 flags such as `-mcpu=power8`, `-mvsx`, `-maltivec`, and `-mcrypto` when used by the patched build |
-| Output metric | prompt-eval tokens/sec for `pp128`; decode tokens/sec for `tg32`; do not mix the two in one headline |
-
-The 147.54 t/s number is a prompt-eval (`pp128`) result, not a mixed
-prompt-plus-generation average. Decode throughput should be reported separately
-with the `tg32` row from `llama-bench`.
+The headline table above is a `pp128` prompt-eval throughput comparison, not a
+mixed prompt-plus-generation average. Decode throughput (`tg32`) should
+always be reported separately, never combined into one number. The full
+reporting contract (model, binaries, NUMA placement, compiler flags, what to
+attach) is in **[BENCHMARK.md](BENCHMARK.md)**, along with which parts of the
+headline claim are measured versus still a reproduction template.
 
 ### 1) Capture machine topology
 
