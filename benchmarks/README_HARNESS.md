@@ -51,6 +51,27 @@ It downloads TinyLlama Q4, prepares the stock llama.cpp benchmark binary when
 not supplied, runs `llama-bench` with `pp128` and `tg32`, and writes a markdown
 table to `benchmarks/out/`.
 
+## POWER8 result reporting checklist
+
+For a claim-quality reproduction of the README headline, include these fields
+with the generated report:
+
+- Model: `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` or the exact alternate GGUF path
+- Benchmark shape: `pp128` prompt-eval and `tg32` decode reported separately
+- Stock binary path and stock llama.cpp commit
+- RAM Coffers binary path and RAM Coffers-patched llama.cpp commit
+- `RUNS`, `THREADS`, and `STOCK_NUMA_NODE`
+- `lscpu` and `numactl --hardware` output from the generated topology file
+- Compiler/CMake settings, especially POWER8 flags such as `-mcpu=power8`,
+  `-mvsx`, `-maltivec`, and `-mcrypto` when used
+- Whether the run used real multi-NUMA POWER8 hardware or `--allow-single-numa`
+  for a smoke test
+
+The README's 147.54 t/s figure is a `pp128` prompt-eval throughput number. Do
+not compare it to `tg32` decode throughput or to a mixed prompt-plus-generation
+average. Non-POWER8 and single-NUMA runs are useful for checking the harness
+shape, but they are not POWER8 performance reproductions.
+
 The harness intentionally refuses to build a synthetic RAM Coffers binary from
 copied headers alone. Pass `--coffers-bin` for a verified hand-patched
 llama.cpp build and `--coffers-commit` for the exact source commit used to build
