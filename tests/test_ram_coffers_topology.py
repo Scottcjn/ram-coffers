@@ -4,6 +4,7 @@ import unittest
 
 from ram_coffers_topology import (
   _parse_numactl_output,
+  _parse_sysfs_numa,
   build_placement_plan,
   calculate_weights,
 )
@@ -32,6 +33,34 @@ node distances:
     self.assertEqual(topology["nodes"][1]["cpus"], [4, 5, 6, 7])
     self.assertEqual(topology["nodes"][1]["size_mb"], 65536)
     self.assertEqual(topology["nodes"][1]["free_mb"], 50000)
+
+  def test_parse_sysfs_numa_reads_memory_value_not_node_id(self):
+    # Reproduces the kernel sysfs layout: "Node <id> MemTotal: <kB> kB".
+    # The memory value is the 4th field; a naive parser grabs the node id
+    # (field 2) instead and reports 0 MB for every node.
+    with tempfile.TemporaryDirectory() as base:
+      layout = {
+        0: {"cpulist": "0-3", "MemTotal": 33554432, "MemFree": 12582912},
+        1: {"cpulist": "4-7", "MemTotal": 67108864, "MemFree": 50331648},
+      }
+      for node_id, spec in layout.items():
+        node_path = os.path.join(base, f"node{node_id}")
+        os.makedirs(node_path)
+        with open(os.path.join(node_path, "cpulist"), "w") as f:
+          f.write(spec["cpulist"] + "\n")
+        with open(os.path.join(node_path, "meminfo"), "w") as f:
+          f.write(f"Node {node_id} MemTotal:       {spec['MemTotal']} kB\n")
+          f.write(f"Node {node_id} MemFree:        {spec['MemFree']} kB\n")
+          f.write(f"Node {node_id} MemUsed:        1000 kB\n")
+
+      topology = _parse_sysfs_numa(base)
+
+    self.assertEqual(topology["num_nodes"], 2)
+    self.assertEqual(topology["nodes"][0]["cpus"], [0, 1, 2, 3])
+    self.assertEqual(topology["nodes"][0]["size_mb"], 33554432 // 1024)
+    self.assertEqual(topology["nodes"][0]["free_mb"], 12582912 // 1024)
+    self.assertEqual(topology["nodes"][1]["size_mb"], 67108864 // 1024)
+    self.assertEqual(topology["nodes"][1]["free_mb"], 50331648 // 1024)
 
   def test_calculate_weights_uses_memory_proportions(self):
     topology = {

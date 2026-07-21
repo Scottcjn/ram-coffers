@@ -78,11 +78,10 @@ def _parse_numactl_output(output: str) -> Dict:
     }
 
 
-def _parse_sysfs_numa() -> Optional[Dict]:
+def _parse_sysfs_numa(node_dir: str = '/sys/devices/system/node') -> Optional[Dict]:
     """Parse NUMA info from /sys filesystem."""
     nodes = {}
-    node_dir = '/sys/devices/system/node'
-    
+
     if not os.path.exists(node_dir):
         return None
     
@@ -117,12 +116,15 @@ def _parse_sysfs_numa() -> Optional[Dict]:
         if os.path.exists(meminfo_path):
             with open(meminfo_path, 'r') as f:
                 for line in f:
+                    # Format: "Node <id> MemTotal:  <value> kB"
+                    # The kB value is field 3, not field 1 (the node id).
+                    parts = line.split()
+                    if len(parts) < 4:
+                        continue
                     if 'MemTotal' in line:
-                        parts = line.split()
-                        node_info['size_mb'] = int(parts[1]) // 1024
+                        node_info['size_mb'] = int(parts[3]) // 1024
                     elif 'MemFree' in line:
-                        parts = line.split()
-                        node_info['free_mb'] = int(parts[1]) // 1024
+                        node_info['free_mb'] = int(parts[3]) // 1024
         
         nodes[node_id] = node_info
     
