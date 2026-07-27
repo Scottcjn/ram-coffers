@@ -225,6 +225,21 @@ Apple Silicon's unified memory means CPU and GPU share the same RAM — coffers 
 cd apple-silicon && make bench
 ```
 
+## Fallback Behavior (non-POWER8 / single-NUMA systems)
+
+Trying the headers on an ordinary x86_64, aarch64, or single-socket box? The
+short answer: `ggml-ram-coffers.h` and `ggml-neuromorphic-coffers.h` compile
+and run correctly anywhere POSIX — POWER8 prefetch macros become no-ops and
+AltiVec math falls back to scalar loops; NUMA absence degrades to a startup
+warning plus default-policy allocation. The mmap placement headers need
+Linux + libnuma headers, and the three collapse kernels
+(`ggml-vcipher-collapse.h`, `ggml-intelligent-collapse.h`,
+`ggml-topk-collapse-vsx.h`) are POWER8-only by design. Off-POWER runs are
+**correctness validation only**, not performance evidence.
+
+Full details, per-platform build matrix, smoke-test instructions, and startup
+detection checklist: [`docs/FALLBACK_BEHAVIOR.md`](docs/FALLBACK_BEHAVIOR.md).
+
 ## Performance Results
 
 On IBM POWER8 S824 with TinyLlama 1.1B Q4_K:
