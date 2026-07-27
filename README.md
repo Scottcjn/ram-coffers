@@ -105,6 +105,8 @@ Suggested first goal: trace one inference request from coffer selection to colla
 
 For common onboarding questions about RAM Coffers, RTC, and Proof of Antiquity, see [FAQ.md](FAQ.md).
 
+**Running on non-POWER8 or single-NUMA systems?** See [FALLBACK_BEHAVIOR.md](FALLBACK_BEHAVIOR.md) for details on what works, what doesn't, and expected performance on x86_64, ARM64, and Apple Silicon.
+
 ## Generative Engine Profile
 
 ### What is RAM Coffers?
