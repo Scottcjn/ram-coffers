@@ -448,8 +448,33 @@ The same POWER8 S824 that hits 147 t/s with RAM Coffers also mines RTC via Proof
 
 ---
 
+## Fallback Behavior
+
+`ram-coffers` is optimized for POWER8 4-socket S824 topology but degrades gracefully on single-NUMA or non-POWER8 platforms.
+
+### 1. Single-NUMA-Node Systems
+* **Memory Allocation:** On single-node Linux systems (or when `mbind` fails), coffer allocation (`ggml-ram-coffers.h:268-337`, `ggml-coffer-mmap.h:112-145`) falls back to node 0 or standard `mmap(MAP_PRIVATE | MAP_ANONYMOUS)`.
+* **Coffer Routing:** All coffer allocations route through single-node memory without throwing allocation or affinity errors.
+
+### 2. Non-POWER8 Architectures (x86_64, aarch64)
+* **Prefetch Pipeline (`dcbt`):** On non-PowerPC architectures (`ggml-ram-coffers.h:103-111`), `DCBT_PREFETCH`, `DCBT_STREAM_START`, and `DCBT_STREAM_STOP` expand to no-op expressions `(void)(addr)`.
+* **SIMD & Vector Operations:** Vector AltiVec/VSX acceleration in `dot_product` (`ggml-ram-coffers.h:204-222`) falls back to a clean scalar C loop when `__powerpc64__` / `__powerpc__` macros are not defined.
+* **Compatibility Layer:** `power8-compat.h:10-42` guards POWER8 specific vector load/store builtins (`vec_xl`, `vec_xst`, `vec_xl_len`).
+
+### 3. Compatibility Build Matrix
+
+| Architecture | Platform | NUMA Support | Prefetch (`dcbt`) | SIMD Acceleration |
+|---|---|---|---|---|
+| **POWER8 Multi-Node** | Linux (ppc64le) | Native 4-Node `mbind` | Native `dcbt` Streams | AltiVec / VSX |
+| **POWER8 Single-Node** | Linux (ppc64le) | Node 0 Fallback | Native `dcbt` Streams | AltiVec / VSX |
+| **x86_64** | Linux / macOS / Windows | Anonymous `mmap` Fallback | No-Op (`(void)`) | Scalar C Loop |
+| **aarch64 / Apple Silicon** | Linux / macOS | Anonymous `mmap` Fallback | No-Op (`(void)`) | Scalar C Loop |
+
+---
+
 <div align="center">
 
 **[Elyan Labs](https://github.com/Scottcjn)** · [RustChain](https://rustchain.org) · [BoTTube](https://bottube.ai)
 
 </div>
+
