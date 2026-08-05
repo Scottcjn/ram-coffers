@@ -23,9 +23,18 @@
 #ifndef GGML_INTELLIGENT_COLLAPSE_H
 #define GGML_INTELLIGENT_COLLAPSE_H
 
-#include <altivec.h>
 #include <stdint.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/*
+ * Capability detection. Pulls in <altivec.h> only where it exists; supplies
+ * coffers_perm_t, coffers_perm_bytes() and coffers_read_timebase() so the
+ * scalar path below can mirror the vector path exactly.
+ */
+#include "coffers-portability.h"
 
 /*===========================================================================
  * Configuration
@@ -50,14 +59,13 @@
  * Hardware Timebase
  *===========================================================================*/
 
+/*
+ * mftb on POWER; CLOCK_MONOTONIC elsewhere. This previously returned a
+ * constant 0 off POWER, which silently disabled entropy variation (every
+ * pattern identical). The portable clock keeps the behaviour meaningful.
+ */
 static inline uint64_t ic_read_tb(void) {
-#if defined(__powerpc64__) || defined(__powerpc__)
-    uint64_t tb;
-    __asm__ __volatile__("mftb %0" : "=r"(tb));
-    return tb;
-#else
-    return 0;
-#endif
+    return coffers_read_timebase();
 }
 
 /*===========================================================================
@@ -70,7 +78,7 @@ static inline uint64_t ic_read_tb(void) {
  * This creates AMPLIFICATION of strong signals.
  *===========================================================================*/
 
-static inline vector unsigned char generate_intelligent_pattern(
+static inline coffers_perm_t generate_intelligent_pattern(
     int layer_id, int position, uint64_t tb
 ) {
     uint32_t h = (uint32_t)(tb ^ (tb >> 32)) ^ (layer_id * 0x9E3779B9U) ^ (position * 0x85EBCA77U);
@@ -89,7 +97,14 @@ static inline vector unsigned char generate_intelligent_pattern(
         p[i] = h % 4;
     }
 
+    /* Pattern bytes are identical on both paths; only the container differs. */
+#if GGML_COFFERS_HAVE_ALTIVEC
     return vec_ld(0, (const vector unsigned char*)p);
+#else
+    coffers_perm_t out;
+    memcpy(out.b, p, 16);
+    return out;
+#endif
 }
 
 /*===========================================================================
@@ -141,13 +156,64 @@ static inline void intelligent_collapse_scores(
     float* scores,           /* In/Out: attention scores */
     int n,                   /* Number of scores */
     int top_k,               /* Keep top K */
-    vector unsigned char pattern,  /* Collapse pattern */
+    coffers_perm_t pattern,  /* Collapse pattern */
     float amplify            /* Amplification factor */
 ) {
     if (n < 4) return;  /* Too few to collapse */
 
     /* Step 1: Find threshold for top-K */
     float threshold = approx_top4_threshold(scores, n);
+
+#if !GGML_COFFERS_HAVE_ALTIVEC
+    /*
+     * SCALAR PATH (non-POWER, or POWER built without -maltivec).
+     *
+     * Reproduces the vec_perm collapse below exactly: vec_perm is a BYTE
+     * permute over the 32-byte concatenation of two vectors, so we do the
+     * same byte permute in plain C, then apply the identical
+     *     result = (c > threshold) ? c * amplify : 0
+     * selection that vec_cmpgt/vec_sel/vec_madd perform. Same logical
+     * result, no intrinsics. Correctness over speed.
+     */
+    {
+        int i = 0;
+        for (; i + 15 < n; i += 16) {
+            unsigned char vb[4][16];
+            unsigned char cb[4][16];
+
+            /* Four 16-byte vectors = 16 consecutive floats */
+            memcpy(vb[0], &scores[i +  0], 16);
+            memcpy(vb[1], &scores[i +  4], 16);
+            memcpy(vb[2], &scores[i +  8], 16);
+            memcpy(vb[3], &scores[i + 12], 16);
+
+            /* Same pairings as the vector path: (0,1) (1,2) (2,3) (3,0) */
+            coffers_perm_bytes(vb[0], vb[1], pattern.b, cb[0]);
+            coffers_perm_bytes(vb[1], vb[2], pattern.b, cb[1]);
+            coffers_perm_bytes(vb[2], vb[3], pattern.b, cb[2]);
+            coffers_perm_bytes(vb[3], vb[0], pattern.b, cb[3]);
+
+            for (int v = 0; v < 4; v++) {
+                float lane[4];
+                memcpy(lane, cb[v], 16);
+                for (int e = 0; e < 4; e++) {
+                    lane[e] = (lane[e] > threshold) ? lane[e] * amplify : 0.0f;
+                }
+                memcpy(&scores[i + v * 4], lane, 16);
+            }
+        }
+
+        /* Scalar remainder (identical to the vector path's tail) */
+        for (; i < n; i++) {
+            if (scores[i] >= threshold) {
+                scores[i] *= amplify;
+            } else {
+                scores[i] = 0.0f;
+            }
+        }
+        return;
+    }
+#else
 
     /* Step 2-4: Vectorized collapse */
     vector float thresh_vec = vec_splats(threshold);
@@ -194,6 +260,7 @@ static inline void intelligent_collapse_scores(
             scores[i] = 0.0f;
         }
     }
+#endif /* GGML_COFFERS_HAVE_ALTIVEC */
 }
 
 /*===========================================================================
@@ -218,6 +285,82 @@ static inline void attention_intelligent(
     uint64_t tb = ic_read_tb();
     float amplify = INTELLIGENT_COLLAPSE_AMPLIFY;
     int top_k = INTELLIGENT_COLLAPSE_TOP_K;
+
+#if !GGML_COFFERS_HAVE_ALTIVEC
+    /*
+     * SCALAR PATH. Same algorithm as the AltiVec version below - Q.K dot
+     * products, intelligent collapse, sparse softmax, sparse V accumulation
+     * - written as plain C loops. The collapse step itself calls the shared
+     * intelligent_collapse_scores(), which has its own scalar path.
+     */
+    {
+        #pragma omp parallel
+        {
+            /*
+             * aligned_alloc requires size to be a multiple of alignment;
+             * malloc is sufficient here since no vector loads are performed.
+             */
+            float* scores = (float*)malloc((size_t)seq_len * sizeof(float));
+            if (scores) {
+                #pragma omp for
+                for (int pos = 0; pos < seq_len; pos++) {
+                    const float* q = Q + (size_t)pos * head_dim;
+                    float* out = output + (size_t)pos * head_dim;
+
+                    coffers_perm_t pattern =
+                        generate_intelligent_pattern(layer_id, pos, tb + (uint64_t)pos);
+
+                    /* Q.K */
+                    for (int t = 0; t <= pos; t++) {
+                        const float* k = K + (size_t)t * head_dim;
+                        float sum = 0.0f;
+                        for (int d = 0; d < head_dim; d++) {
+                            sum += q[d] * k[d];
+                        }
+                        scores[t] = sum;
+                    }
+
+                    /* INTELLIGENT COLLAPSE */
+                    intelligent_collapse_scores(scores, pos + 1, top_k, pattern, amplify);
+
+                    /* Sparse softmax */
+                    float max_s = -1e30f;
+                    for (int t = 0; t <= pos; t++) {
+                        if (scores[t] > max_s) max_s = scores[t];
+                    }
+
+                    float sum_exp = 0.0f;
+                    for (int t = 0; t <= pos; t++) {
+                        if (scores[t] > 0.0f) {
+                            scores[t] = expf(scores[t] - max_s);
+                            sum_exp += scores[t];
+                        }
+                    }
+
+                    if (sum_exp > 0.0f) {
+                        for (int t = 0; t <= pos; t++) {
+                            scores[t] /= sum_exp;
+                        }
+                    }
+
+                    /* Sparse V.scores (skip zeros) */
+                    memset(out, 0, (size_t)head_dim * sizeof(float));
+                    for (int t = 0; t <= pos; t++) {
+                        float w = scores[t];
+                        if (w < 0.001f) continue;
+
+                        const float* v = V + (size_t)t * head_dim;
+                        for (int d = 0; d < head_dim; d++) {
+                            out[d] += v[d] * w;
+                        }
+                    }
+                }
+                free(scores);
+            }
+        }
+        return;
+    }
+#else
 
     #pragma omp parallel
     {
@@ -287,6 +430,7 @@ static inline void attention_intelligent(
 
         free(scores);
     }
+#endif /* GGML_COFFERS_HAVE_ALTIVEC */
 }
 
 /*===========================================================================

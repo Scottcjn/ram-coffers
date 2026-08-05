@@ -32,11 +32,12 @@
 #include <sys/stat.h>
 #include <math.h>
 
-#ifdef __linux__
-#include <numa.h>
-#include <numaif.h>
-#include <sched.h>
-#endif
+/*
+ * Capability detection + NUMA/intrinsic shims. The former guards here were
+ * "#ifdef __linux__", which still required <numa.h> to exist on every Linux
+ * box - so a Linux machine without libnuma-dev failed to compile.
+ */
+#include "coffers-portability.h"
 
 /*===========================================================================
  * Configuration
@@ -46,7 +47,13 @@
 #define COFFER_EMBED_DIM 128    /* Resonance embedding dimension */
 #define COFFER_MAX_DOMAINS 16   /* Domain signatures per coffer */
 
-/* POWER8 NUMA topology (Node → Coffer mapping for optimal layout) */
+/*
+ * POWER8 S824 topology (4 nodes, ordered largest-free-space first).
+ * These remain as the reference layout, but are NO LONGER indexed directly:
+ * on a 1- or 2-node machine they would name nodes that do not exist. Use
+ * coffers_node_for(coffer_id) from coffers-portability.h, which derives the
+ * mapping from the node count actually detected.
+ */
 static const int NUMA_TO_COFFER[4] = {2, 1, 3, 0};  /* Node 0→C2, 1→C1, 2→C3, 3→C0 */
 static const int COFFER_TO_NUMA[4] = {3, 1, 0, 2};  /* C0→Node3, C1→Node1, etc */
 
@@ -100,19 +107,24 @@ static int g_coffers_initialized = 0;
  * POWER8 DCBT Prefetch Macros
  *===========================================================================*/
 
-#if defined(__powerpc64__) || defined(__powerpc__)
+/*
+ * POWER8 has dcbt with hardware prefetch STREAMS (start/stop), which no other
+ * architecture exposes. Elsewhere we fall back to __builtin_prefetch for the
+ * per-line touch and drop the stream hints, which are advisory anyway.
+ */
+#if GGML_COFFERS_IS_POWER
 #define DCBT_PREFETCH(addr) __asm__ __volatile__("dcbt 0,%0" : : "r"(addr))
 #define DCBT_STREAM_START(addr, id) __asm__ __volatile__("dcbt 0,%0,%1" : : "r"(addr), "i"(id))
 #define DCBT_STREAM_STOP(id) __asm__ __volatile__("dcbt 0,0,%0" : : "i"(id | 0x10))
 #else
-#define DCBT_PREFETCH(addr) (void)(addr)
-#define DCBT_STREAM_START(addr, id) (void)(addr)
-#define DCBT_STREAM_STOP(id) (void)0
+#define DCBT_PREFETCH(addr) coffers_prefetch(addr)
+#define DCBT_STREAM_START(addr, id) ((void)(addr), (void)(id))
+#define DCBT_STREAM_STOP(id) ((void)(id))
 #endif
 
 /* Prefetch entire region to L2/L3 */
 static inline void dcbt_resident(const void* addr, size_t size) {
-    const size_t cache_line = 128;  /* POWER8 cache line */
+    const size_t cache_line = COFFERS_CACHE_LINE;
     const char* p = (const char*)addr;
     const char* end = p + size;
 
@@ -179,7 +191,7 @@ static inline void layer_prefetch_ahead(int layer_id) {
         /* Use stream 1 for look-ahead (stream 0 may be in use) */
         DCBT_STREAM_START(next_addr, 1);
 
-        const size_t cache_line = 128;
+        const size_t cache_line = COFFERS_CACHE_LINE;
         const char* p = next_addr;
         const char* end = p + prefetch_size;
 
@@ -201,8 +213,12 @@ static inline void layer_prefetch_ahead(int layer_id) {
 
 static inline float dot_product(const float* a, const float* b, int dim) {
     float sum = 0.0f;
-#if defined(__powerpc64__) || defined(__powerpc__)
-    #include <altivec.h>
+#if GGML_COFFERS_HAVE_ALTIVEC
+    /*
+     * NOTE: <altivec.h> used to be #included HERE, inside the function body.
+     * It is now included once at file scope by coffers-portability.h, which
+     * is both correct and what let this compile under -Werror.
+     */
     vector float vsum = vec_splats(0.0f);
     int d = 0;
     for (; d + 3 < dim; d += 4) {
@@ -264,22 +280,46 @@ static int route_to_coffer(const float* query_embed) {
  * Coffer Initialization
  *===========================================================================*/
 
+/*
+ * Number of coffers usable on this machine. 1 in uniform-memory mode.
+ * Everything that used to loop to MAX_COFFERS should bound on this.
+ */
+static int g_coffers_usable = 0;
+
+static inline int coffer_count(void) {
+    if (g_coffers_usable > 0) return g_coffers_usable;
+    const coffers_topology_t* t = coffers_topology();
+    g_coffers_usable = t->n_coffers < MAX_COFFERS ? t->n_coffers : MAX_COFFERS;
+    if (g_coffers_usable < 1) g_coffers_usable = 1;
+    return g_coffers_usable;
+}
+
+/*
+ * Initialise coffer→node bindings.
+ *
+ * Returns 0 in ALL supported configurations, including no-NUMA and
+ * single-node. Uniform memory is a valid topology (1 coffer over all RAM),
+ * not a failure - the old code returned -1 here and callers printed a
+ * warning about running "without NUMA support" on perfectly ordinary
+ * single-socket machines.
+ */
 static int coffer_init_numa(void) {
-#ifdef __linux__
-    if (numa_available() < 0) {
-        fprintf(stderr, "Coffers: NUMA not available\n");
-        return -1;
-    }
+    coffers_report_mode();
 
-    int n_nodes = numa_num_configured_nodes();
-    fprintf(stderr, "Coffers: %d NUMA nodes detected\n", n_nodes);
-
-    for (int c = 0; c < MAX_COFFERS && c < n_nodes; c++) {
+    int n = coffer_count();
+    for (int c = 0; c < n; c++) {
         g_coffers[c].coffer_id = c;
-        g_coffers[c].numa_node = COFFER_TO_NUMA[c];
+        g_coffers[c].numa_node = coffers_node_for(c);
         snprintf(g_coffers[c].name, sizeof(g_coffers[c].name), "Coffer-%d", c);
     }
-#endif
+
+    /* Coffers beyond the usable count stay unbound and unloaded. */
+    for (int c = n; c < MAX_COFFERS; c++) {
+        g_coffers[c].coffer_id = c;
+        g_coffers[c].numa_node = COFFERS_UNIFORM_NODE;
+        g_coffers[c].is_loaded = 0;
+    }
+
     return 0;
 }
 
@@ -291,10 +331,8 @@ static int coffer_load_shard(int coffer_id, const char* gguf_path) {
 
     ram_coffer_t* coffer = &g_coffers[coffer_id];
 
-#ifdef __linux__
-    /* Bind to coffer's NUMA node for allocation */
-    numa_run_on_node(coffer->numa_node);
-#endif
+    /* Bind to coffer's NUMA node for allocation (no-op in uniform mode) */
+    coffers_run_on_node(coffer->numa_node);
 
     /* Open file */
     coffer->fd = open(gguf_path, O_RDONLY);
@@ -311,15 +349,14 @@ static int coffer_load_shard(int coffer_id, const char* gguf_path) {
     /* mmap with huge pages if available */
     int mmap_flags = MAP_PRIVATE;
 
-#ifdef __linux__
     /*
      * FIX: Set memory policy BEFORE mmap to allocate on correct node.
      * This avoids mbind(MPOL_MF_MOVE) which stalls on page migration.
      * Thanks to ng @ NYSE for this optimization.
+     *
+     * In uniform-memory mode this is a no-op and mmap proceeds normally.
      */
-    unsigned long nodemask = 1UL << coffer->numa_node;
-    set_mempolicy(MPOL_BIND, &nodemask, sizeof(nodemask) * 8);
-#endif
+    coffers_set_membind(coffer->numa_node);
 
 #ifdef MAP_HUGETLB
     /* Try huge pages first, fall back to normal */
@@ -334,10 +371,8 @@ static int coffer_load_shard(int coffer_id, const char* gguf_path) {
                             mmap_flags, coffer->fd, 0);
 #endif
 
-#ifdef __linux__
     /* Reset to default policy for future allocations */
-    set_mempolicy(MPOL_DEFAULT, NULL, 0);
-#endif
+    coffers_reset_mempolicy();
 
     if (coffer->mmap_ptr == MAP_FAILED) {
         fprintf(stderr, "Coffers: mmap failed for %s\n", gguf_path);
@@ -421,10 +456,8 @@ static int activate_coffer_ex(int coffer_id, int n_layers) {
     ram_coffer_t* coffer = &g_coffers[coffer_id];
     if (!coffer->is_loaded) return -1;
 
-#ifdef __linux__
-    /* Bind to coffer's NUMA node */
-    numa_run_on_node(coffer->numa_node);
-#endif
+    /* Bind to coffer's NUMA node (no-op in uniform mode) */
+    coffers_run_on_node(coffer->numa_node);
 
     if (n_layers > 0) {
         /*
@@ -528,8 +561,10 @@ static int init_ram_coffers(const char* gguf_paths[MAX_COFFERS]) {
     fprintf(stderr, "║  RAM Coffers System - POWER8 S824 NUMA Weight Banking        ║\n");
     fprintf(stderr, "╠═══════════════════════════════════════════════════════════════╣\n");
 
-    if (coffer_init_numa() < 0) {
-        fprintf(stderr, "║  WARNING: Running without NUMA support                      ║\n");
+    coffer_init_numa();
+
+    if (coffers_topology()->uniform) {
+        fprintf(stderr, "║  Uniform-memory mode: 1 coffer over all RAM (no affinity)    ║\n");
     }
 
     /* Load shards */
@@ -601,12 +636,21 @@ static void shutdown_ram_coffers(void) {
 
     for (int c = 0; c < MAX_COFFERS; c++) {
         ram_coffer_t* coffer = &g_coffers[c];
+        if (!coffer->is_loaded) continue;   /* never opened - nothing to release */
+
         if (coffer->mmap_ptr && coffer->mmap_ptr != MAP_FAILED) {
             munmap(coffer->mmap_ptr, coffer->mmap_size);
+            coffer->mmap_ptr = NULL;
         }
-        if (coffer->fd >= 0) {
+        /*
+         * Guard on > 0, not >= 0: g_coffers is zero-initialised, so an
+         * unopened coffer has fd == 0 and the old check closed STDIN.
+         */
+        if (coffer->fd > 0) {
             close(coffer->fd);
+            coffer->fd = -1;
         }
+        coffer->is_loaded = 0;
     }
 
     g_coffers_initialized = 0;

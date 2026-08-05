@@ -16,10 +16,13 @@
 #ifndef GGML_TOPK_COLLAPSE_VSX_H
 #define GGML_TOPK_COLLAPSE_VSX_H
 
-#include <altivec.h>
 #include <stdint.h>
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
+
+/* Capability detection; includes <altivec.h> only where it exists. */
+#include "coffers-portability.h"
 
 /*===========================================================================
  * Configuration
@@ -44,14 +47,9 @@
  * Hardware Entropy
  *===========================================================================*/
 
+/* mftb on POWER; CLOCK_MONOTONIC elsewhere (was a constant 0 off POWER). */
 static inline uint64_t topk_read_timebase(void) {
-#if defined(__powerpc64__) || defined(__powerpc__)
-    uint64_t tb;
-    __asm__ __volatile__("mftb %0" : "=r"(tb));
-    return tb;
-#else
-    return 0;
-#endif
+    return coffers_read_timebase();
 }
 
 /*===========================================================================
@@ -60,6 +58,14 @@ static inline uint64_t topk_read_timebase(void) {
  * Instead of full sort, use vec_perm to quickly identify
  * approximate top-K elements. Not exact, but fast.
  *===========================================================================*/
+
+/*
+ * The compare-swap sorting-network helpers below take and return AltiVec
+ * `vector float` and have no portable public analogue, so they are confined
+ * to the POWER path. Nothing in the scalar path references them: the actual
+ * top-K threshold comes from find_kth_largest(), which is already plain C.
+ */
+#if GGML_COFFERS_HAVE_ALTIVEC
 
 /* Compare-swap patterns for vec_perm based sorting network */
 static const unsigned char COMPARE_LO_PATTERN[16] __attribute__((aligned(16))) = {
@@ -96,6 +102,8 @@ static inline vector float vec_perm_top4_of_8(
     vec_perm_compare_swap(v0, v1, &min_vals, &max_vals);
     return max_vals;  /* Top 4 are in max_vals */
 }
+
+#endif /* GGML_COFFERS_HAVE_ALTIVEC */
 
 /*===========================================================================
  * Top-K Attention Score Selection
@@ -161,6 +169,12 @@ static inline float find_kth_largest(
 static inline void apply_topk_mask_vsx(
     float* scores, int n, float threshold
 ) {
+#if !GGML_COFFERS_HAVE_ALTIVEC
+    /* Scalar path: identical semantics, keep if >= threshold else zero. */
+    for (int i = 0; i < n; i++) {
+        if (scores[i] < threshold) scores[i] = 0.0f;
+    }
+#else
     vector float thresh_vec = vec_splats(threshold);
     vector float zero_vec = vec_splats(0.0f);
 
@@ -179,6 +193,7 @@ static inline void apply_topk_mask_vsx(
     for (; i < n; i++) {
         if (scores[i] < threshold) scores[i] = 0.0f;
     }
+#endif /* GGML_COFFERS_HAVE_ALTIVEC */
 }
 
 /*===========================================================================
@@ -213,6 +228,14 @@ static inline void attention_topk_collapsed(
         for (int t = 0; t <= pos; t++) {
             const float* k_row = K + t * head_dim;
 
+#if !GGML_COFFERS_HAVE_ALTIVEC
+            /* Scalar dot product - same result as the VSX reduction below */
+            float sum_s = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                sum_s += q_row[d] * k_row[d];
+            }
+            scores[t] = sum_s;
+#else
             /* Standard dot product */
             vector float sum = vec_splats(0.0f);
             for (int d = 0; d + 3 < head_dim; d += 4) {
@@ -225,6 +248,7 @@ static inline void attention_topk_collapsed(
             vector float s1 = vec_add(sum, vec_sld(sum, sum, 8));
             vector float s2 = vec_add(s1, vec_sld(s1, s1, 4));
             vec_ste(s2, 0, &scores[t]);
+#endif
         }
 
         /* TOP-K COLLAPSE: Keep only strongest signals */
@@ -262,6 +286,11 @@ static inline void attention_topk_collapsed(
 
             const float* v_row = V + t * head_dim;
 
+#if !GGML_COFFERS_HAVE_ALTIVEC
+            for (int d = 0; d < head_dim; d++) {
+                out_row[d] += v_row[d] * weight;
+            }
+#else
             for (int d = 0; d + 3 < head_dim; d += 4) {
                 vector float v_vec = vec_ld(0, &v_row[d]);
                 vector float o_vec = vec_ld(0, &out_row[d]);
@@ -269,6 +298,7 @@ static inline void attention_topk_collapsed(
                 o_vec = vec_madd(v_vec, w_vec, o_vec);
                 vec_st(o_vec, 0, &out_row[d]);
             }
+#endif
         }
     }
 }

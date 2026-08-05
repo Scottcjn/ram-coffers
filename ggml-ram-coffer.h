@@ -22,9 +22,13 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <numa.h>
-#include <numaif.h>
-#include <sched.h>
+
+/*
+ * Capability detection + NUMA/intrinsic shims. This replaces the former
+ * unconditional <numa.h>/<numaif.h>/<sched.h> includes, which made this
+ * header fail to COMPILE on any machine without libnuma-dev.
+ */
+#include "coffers-portability.h"
 
 /*===========================================================================
  * POWER8 S824 NUMA Configuration
@@ -39,6 +43,11 @@
  * - Fast pair B: Node 2 + Node 3 (260GB, distance 20)
  *===========================================================================*/
 
+/*
+ * NUM_NUMA_NODES is the array CAPACITY, not an assumption about the machine.
+ * The number of nodes actually present is discovered at init and stored in
+ * ram_coffer_t::n_nodes; every loop below bounds on that, never on this.
+ */
 #define NUM_NUMA_NODES 4
 #define COFFER_MAX_LAYERS 128
 #define COFFER_MAX_TENSORS 4096
@@ -67,6 +76,8 @@ typedef struct {
 /* RAM Coffer - the indexed weight store */
 typedef struct {
     numa_node_info_t nodes[NUM_NUMA_NODES];
+    int n_nodes;         /* Nodes actually detected (>=1, <=NUM_NUMA_NODES) */
+    int uniform;         /* 1 = uniform-memory mode (no NUMA / single node) */
     tensor_location_t tensors[COFFER_MAX_TENSORS];
     int num_tensors;
 
@@ -87,35 +98,54 @@ static ram_coffer_t g_coffer = {0};
  * Initialization
  *===========================================================================*/
 
+/*
+ * Initialise the coffer.
+ *
+ * NEVER fails just because NUMA is missing. When libnuma is absent, or
+ * present but reporting a single node, we fall back to UNIFORM-MEMORY MODE:
+ * one coffer covering all of RAM. Everything downstream (placement,
+ * prefetch, load, stats) still works - it simply has no node affinity to
+ * exploit. Returns 0 on success; -1 only on a genuine error.
+ */
 static int coffer_init(void) {
-    if (numa_available() < 0) {
-        fprintf(stderr, "NUMA not available!\n");
-        return -1;
-    }
+    const coffers_topology_t* topo = coffers_topology();
+    coffers_report_mode();
 
-    int num_nodes = numa_num_configured_nodes();
-    fprintf(stderr, "RAM Coffer: Detected %d NUMA nodes\n", num_nodes);
+    g_coffer.uniform = topo->uniform;
+    g_coffer.n_nodes = topo->n_nodes < NUM_NUMA_NODES ? topo->n_nodes : NUM_NUMA_NODES;
+    if (g_coffer.n_nodes < 1) g_coffer.n_nodes = 1;
 
-    for (int i = 0; i < num_nodes && i < NUM_NUMA_NODES; i++) {
-        long long free_bytes, total_bytes;
-        total_bytes = numa_node_size64(i, &free_bytes);
+    /* Distribute the machine's CPUs across the detected nodes. */
+    int n_cpus = 1;
+#if defined(_SC_NPROCESSORS_ONLN)
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    if (online > 0) n_cpus = (int)online;
+#endif
+    int cpus_per_node = n_cpus / g_coffer.n_nodes;
+    if (cpus_per_node < 1) cpus_per_node = 1;
 
-        g_coffer.nodes[i].node_id = i;
+    for (int i = 0; i < g_coffer.n_nodes; i++) {
+        size_t free_bytes = 0;
+        size_t total_bytes = coffers_node_memory(i, &free_bytes);
+
+        g_coffer.nodes[i].node_id     = i;
         g_coffer.nodes[i].total_bytes = total_bytes;
-        g_coffer.nodes[i].free_bytes = free_bytes;
-        g_coffer.nodes[i].used_bytes = 0;
+        g_coffer.nodes[i].free_bytes  = free_bytes;
+        g_coffer.nodes[i].used_bytes  = 0;
 
-        /* CPU ranges (POWER8 S824 specific) */
-        g_coffer.nodes[i].cpu_start = i * 32;
-        g_coffer.nodes[i].cpu_end = (i + 1) * 32 - 1;
+        g_coffer.nodes[i].cpu_start = i * cpus_per_node;
+        g_coffer.nodes[i].cpu_end   = (i + 1) * cpus_per_node - 1;
 
-        /* Paired nodes (fast access partners) */
-        if (i == 0) g_coffer.nodes[i].paired_node = 1;
-        else if (i == 1) g_coffer.nodes[i].paired_node = 0;
-        else if (i == 2) g_coffer.nodes[i].paired_node = 3;
-        else g_coffer.nodes[i].paired_node = 2;
+        /*
+         * Pair each node with its neighbour for bandwidth (POWER8: 0<->1,
+         * 2<->3). With an odd node count the last node pairs with itself.
+         */
+        int partner = (i % 2 == 0) ? i + 1 : i - 1;
+        if (partner >= g_coffer.n_nodes) partner = i;
+        g_coffer.nodes[i].paired_node = partner;
 
-        fprintf(stderr, "  Node %d: %.1f GB total, %.1f GB free, CPUs %d-%d, paired with %d\n",
+        fprintf(stderr,
+                "  Node %d: %.1f GB total, %.1f GB free, CPUs %d-%d, paired with %d\n",
                 i,
                 total_bytes / (1024.0 * 1024.0 * 1024.0),
                 free_bytes / (1024.0 * 1024.0 * 1024.0),
@@ -143,14 +173,29 @@ static int coffer_plan_layer_placement(int total_layers, size_t layer_size_bytes
     fprintf(stderr, "\nRAM Coffer: Planning placement for %d layers (%.1f MB each)\n",
             total_layers, layer_size_bytes / (1024.0 * 1024.0));
 
-    /* Sort nodes by free space */
-    int node_order[NUM_NUMA_NODES] = {1, 3, 0, 2};  /* Largest first */
+    int n_nodes = g_coffer.n_nodes > 0 ? g_coffer.n_nodes : 1;
 
-    int layers_per_node = total_layers / NUM_NUMA_NODES;
-    int remainder = total_layers % NUM_NUMA_NODES;
+    /*
+     * Sort nodes by free space, largest first. This used to be the hardcoded
+     * literal {1,3,0,2} - correct only for the POWER8 S824, and an
+     * out-of-bounds node id on any machine with fewer than 4 nodes.
+     */
+    int node_order[NUM_NUMA_NODES];
+    for (int i = 0; i < n_nodes; i++) node_order[i] = i;
+    for (int i = 0; i < n_nodes - 1; i++) {
+        for (int j = i + 1; j < n_nodes; j++) {
+            if (g_coffer.nodes[node_order[j]].free_bytes >
+                g_coffer.nodes[node_order[i]].free_bytes) {
+                int tmp = node_order[i]; node_order[i] = node_order[j]; node_order[j] = tmp;
+            }
+        }
+    }
+
+    int layers_per_node = total_layers / n_nodes;
+    int remainder = total_layers % n_nodes;
 
     int layer = 0;
-    for (int n = 0; n < NUM_NUMA_NODES; n++) {
+    for (int n = 0; n < n_nodes; n++) {
         int node = node_order[n];
         int node_layers = layers_per_node + (n < remainder ? 1 : 0);
 
@@ -171,8 +216,11 @@ static int coffer_plan_layer_placement(int total_layers, size_t layer_size_bytes
  *===========================================================================*/
 
 static void* coffer_alloc_on_node(size_t size, int numa_node, const char* name) {
-    /* Allocate on specific NUMA node */
-    void* ptr = numa_alloc_onnode(size, numa_node);
+    /* Clamp to a node that actually exists (uniform mode always uses node 0) */
+    if (numa_node < 0 || numa_node >= g_coffer.n_nodes) numa_node = COFFERS_UNIFORM_NODE;
+
+    /* Allocate on specific NUMA node (plain malloc in uniform mode) */
+    void* ptr = coffers_alloc_on_node(size, numa_node);
     if (!ptr) {
         fprintf(stderr, "Failed to allocate %.1f MB on node %d\n",
                 size / (1024.0 * 1024.0), numa_node);
@@ -202,24 +250,17 @@ static void* coffer_alloc_on_node(size_t size, int numa_node, const char* name) 
  * - dcbz: Data Cache Block Zero (allocate without fetch)
  *===========================================================================*/
 
-/* Prefetch a cache line (128 bytes on POWER8) */
+/*
+ * Prefetch a cache line. dcbt on POWER8 (128-byte line), __builtin_prefetch
+ * elsewhere, no-op on compilers offering neither. See coffers-portability.h.
+ */
 static inline void coffer_prefetch(const void* addr) {
-#if defined(__powerpc64__) || defined(__powerpc__)
-    __asm__ __volatile__("dcbt 0,%0" : : "r"(addr));
-#endif
+    coffers_prefetch(addr);
 }
 
 /* Prefetch an entire tensor (strided for cache efficiency) */
 static inline void coffer_prefetch_tensor(const void* addr, size_t size) {
-    const size_t cache_line = 128;
-    const char* p = (const char*)addr;
-    const char* end = p + size;
-
-    /* Prefetch every cache line */
-    while (p < end) {
-        coffer_prefetch(p);
-        p += cache_line;
-    }
+    coffers_prefetch_range(addr, size);
 }
 
 /* Prefetch layer weights before we need them */
@@ -237,17 +278,19 @@ static inline void coffer_prefetch_layer(int layer_id) {
  * CPU Affinity - Run computation on CPUs local to the memory
  *===========================================================================*/
 
+/*
+ * Bind the calling thread to the CPUs local to a node.
+ * In uniform-memory mode this is a successful no-op - there is nowhere else
+ * to run, so "already local" is the correct answer, not a failure.
+ */
 static int coffer_bind_to_node(int numa_node) {
-    struct bitmask* mask = numa_allocate_cpumask();
-    numa_node_to_cpus(numa_node, mask);
+    if (g_coffer.uniform) return 0;
+    if (numa_node < 0 || numa_node >= g_coffer.n_nodes) return 0;
 
-    if (numa_sched_setaffinity(0, mask) < 0) {
+    if (coffers_bind_thread_to_node(numa_node) < 0) {
         fprintf(stderr, "Failed to bind to node %d\n", numa_node);
-        numa_free_cpumask(mask);
         return -1;
     }
-
-    numa_free_cpumask(mask);
     return 0;
 }
 
@@ -266,14 +309,12 @@ static int coffer_bind_to_tensor(const char* tensor_name) {
  *===========================================================================*/
 
 static int coffer_get_tensor_node(const void* addr) {
-    int node = -1;
-    get_mempolicy(&node, NULL, 0, (void*)addr, MPOL_F_NODE | MPOL_F_ADDR);
-    return node;
+    return coffers_node_of_addr(addr);
 }
 
 static void coffer_record_access(const void* addr, int accessing_cpu) {
     int tensor_node = coffer_get_tensor_node(addr);
-    int cpu_node = numa_node_of_cpu(accessing_cpu);
+    int cpu_node = coffers_node_of_cpu(accessing_cpu);
 
     if (tensor_node == cpu_node) {
         g_coffer.local_accesses++;
@@ -348,13 +389,15 @@ static void coffer_print_stats(void) {
     fprintf(stderr, "║  Prefetch hits:      %10lu                           ║\n",
             (unsigned long)g_coffer.prefetch_hits);
     fprintf(stderr, "╠═══════════════════════════════════════════════════════════╣\n");
-    fprintf(stderr, "║  NUMA Node Usage:                                         ║\n");
-    for (int i = 0; i < NUM_NUMA_NODES; i++) {
+    fprintf(stderr, "║  %-56s ║\n",
+            g_coffer.uniform ? "Memory Usage (uniform mode):" : "NUMA Node Usage:");
+    for (int i = 0; i < g_coffer.n_nodes; i++) {
+        double total = (double)g_coffer.nodes[i].total_bytes;
         fprintf(stderr, "║    Node %d: %6.1f GB / %6.1f GB (%.1f%%)                   ║\n",
                 i,
                 g_coffer.nodes[i].used_bytes / (1024.0 * 1024.0 * 1024.0),
-                g_coffer.nodes[i].total_bytes / (1024.0 * 1024.0 * 1024.0),
-                100.0 * g_coffer.nodes[i].used_bytes / g_coffer.nodes[i].total_bytes);
+                total / (1024.0 * 1024.0 * 1024.0),
+                total > 0.0 ? 100.0 * g_coffer.nodes[i].used_bytes / total : 0.0);
     }
     fprintf(stderr, "╚═══════════════════════════════════════════════════════════╝\n");
 }
@@ -396,7 +439,7 @@ static int coffer_plan_model(model_topology_t* model) {
 
     /* Check if model fits */
     size_t total_free = 0;
-    for (int i = 0; i < NUM_NUMA_NODES; i++) {
+    for (int i = 0; i < g_coffer.n_nodes; i++) {
         total_free += g_coffer.nodes[i].free_bytes;
     }
 

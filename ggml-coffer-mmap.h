@@ -24,8 +24,13 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <numa.h>
-#include <numaif.h>
+
+/*
+ * Capability detection + NUMA shims. Replaces the former unconditional
+ * <numa.h>/<numaif.h> includes, which broke the build outright on machines
+ * without libnuma-dev.
+ */
+#include "coffers-portability.h"
 
 /*===========================================================================
  * GGUF Format Structures (minimal parser)
@@ -84,8 +89,8 @@ typedef struct {
     coffer_tensor_info_t* tensors;
     int n_tensors;
 
-    /* NUMA placement stats */
-    size_t bytes_per_node[4];
+    /* NUMA placement stats (indexed by node id; 1 entry in uniform mode) */
+    size_t bytes_per_node[COFFERS_TOPOLOGY_MAX];
 } coffer_mmap_ctx_t;
 
 /*===========================================================================
@@ -153,32 +158,44 @@ static int extract_layer_id(const char* name) {
  * Strategy: Distribute layers evenly by memory, not count
  *===========================================================================*/
 
+/*
+ * Assign a tensor to a NUMA node.
+ *
+ * Topology-adaptive: with 1 node (or no NUMA) everything lands on node 0,
+ * which is exactly right - there is only one place to put it. With 4 nodes
+ * the original POWER8 S824 ordering is preserved. With any other count the
+ * layers are spread evenly over the nodes that actually exist.
+ */
 static int assign_numa_node(int layer_id, int total_layers, const char* tensor_name) {
-    /* Special tensors */
-    if (strstr(tensor_name, "token_embd") || strstr(tensor_name, "embed")) {
-        return 0;  /* Embedding on Node 0 */
-    }
-    if (strstr(tensor_name, "output") || strstr(tensor_name, "lm_head")) {
-        return 2;  /* Output on Node 2 (smallest) */
+    const coffers_topology_t* topo = coffers_topology();
+    int n = topo->n_nodes;
+
+    /* Uniform memory: one destination, no decision to make. */
+    if (n <= 1) return COFFERS_UNIFORM_NODE;
+
+    /* Preserve the tuned 4-node POWER8 layout exactly as it was. */
+    if (n == 4) {
+        if (strstr(tensor_name, "token_embd") || strstr(tensor_name, "embed")) return 0;
+        if (strstr(tensor_name, "output") || strstr(tensor_name, "lm_head"))   return 2;
+        if (layer_id < 0) return 0;
+
+        float progress = (float)layer_id / (total_layers > 0 ? total_layers : 1);
+        if (progress < 0.25f)      return 0;  /* Early layers  → Node 0 */
+        else if (progress < 0.50f) return 1;  /* Quarter 2     → Node 1 */
+        else if (progress < 0.75f) return 3;  /* Quarter 3     → Node 3 */
+        else                       return 2;  /* Late layers   → Node 2 */
     }
 
-    /* Layer-based distribution */
-    if (layer_id < 0) {
-        return 0;  /* Unknown goes to Node 0 */
-    }
+    /* General case: embeddings first node, output last node, layers spread. */
+    if (strstr(tensor_name, "token_embd") || strstr(tensor_name, "embed")) return 0;
+    if (strstr(tensor_name, "output") || strstr(tensor_name, "lm_head"))   return n - 1;
+    if (layer_id < 0) return 0;
 
-    /* Split layers across nodes */
     float progress = (float)layer_id / (total_layers > 0 ? total_layers : 1);
-
-    if (progress < 0.25f) {
-        return 0;  /* Early layers → Node 0 */
-    } else if (progress < 0.50f) {
-        return 1;  /* Quarter 2 → Node 1 */
-    } else if (progress < 0.75f) {
-        return 3;  /* Quarter 3 → Node 3 */
-    } else {
-        return 2;  /* Late layers → Node 2 */
-    }
+    int node = (int)(progress * (float)n);
+    if (node < 0)  node = 0;
+    if (node >= n) node = n - 1;
+    return node;
 }
 
 /*===========================================================================
@@ -280,31 +297,13 @@ static coffer_mmap_ctx_t* coffer_mmap_open(const char* path) {
  * This is the key to NUMA-aware inference!
  *===========================================================================*/
 
+/*
+ * Migrate a region to a node. In uniform-memory mode this succeeds as a
+ * no-op: the pages are already in the only memory region there is, so
+ * reporting failure would be wrong and would abort otherwise-valid loads.
+ */
 static int coffer_migrate_region(void* addr, size_t size, int target_node) {
-    if (numa_available() < 0) {
-        return -1;
-    }
-
-    /* Create node mask for target */
-    unsigned long nodemask = 1UL << target_node;
-
-    /* Align to page boundary */
-    size_t page_size = sysconf(_SC_PAGESIZE);
-    uintptr_t aligned_addr = (uintptr_t)addr & ~(page_size - 1);
-    size_t aligned_size = size + ((uintptr_t)addr - aligned_addr);
-    aligned_size = (aligned_size + page_size - 1) & ~(page_size - 1);
-
-    /* Migrate pages */
-    int ret = mbind((void*)aligned_addr, aligned_size, MPOL_BIND,
-                    &nodemask, sizeof(nodemask) * 8, MPOL_MF_MOVE);
-
-    if (ret < 0) {
-        /* mbind can fail if pages are shared, try MPOL_PREFERRED instead */
-        ret = mbind((void*)aligned_addr, aligned_size, MPOL_PREFERRED,
-                    &nodemask, sizeof(nodemask) * 8, 0);
-    }
-
-    return ret;
+    return coffers_bind_range(addr, size, target_node);
 }
 
 /*===========================================================================
@@ -319,7 +318,8 @@ static int coffer_place_tensors(coffer_mmap_ctx_t* ctx, int total_layers) {
     fprintf(stderr, "║  Coffer NUMA Tensor Placement                             ║\n");
     fprintf(stderr, "╠═══════════════════════════════════════════════════════════╣\n");
 
-    size_t migrated[4] = {0, 0, 0, 0};
+    const coffers_topology_t* topo = coffers_topology();
+    size_t migrated[COFFERS_TOPOLOGY_MAX] = {0};
     int placed = 0;
 
     for (int i = 0; i < ctx->n_tensors; i++) {
@@ -336,13 +336,16 @@ static int coffer_place_tensors(coffer_mmap_ctx_t* ctx, int total_layers) {
         void* tensor_addr = (uint8_t*)ctx->mapped_addr + ctx->tensor_data_offset + t->offset;
 
         /* Migrate to target node */
+        if (t->target_node < 0 || t->target_node >= COFFERS_TOPOLOGY_MAX) {
+            t->target_node = COFFERS_UNIFORM_NODE;
+        }
         if (coffer_migrate_region(tensor_addr, t->size_bytes, t->target_node) >= 0) {
             migrated[t->target_node] += t->size_bytes;
             placed++;
         }
     }
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < topo->n_nodes && i < COFFERS_TOPOLOGY_MAX; i++) {
         ctx->bytes_per_node[i] = migrated[i];
         fprintf(stderr, "║  Node %d: %8.2f GB placed                               ║\n",
                 i, migrated[i] / (1024.0 * 1024.0 * 1024.0));
@@ -368,23 +371,29 @@ typedef struct {
 } coffer_model_hint_t;
 
 static int coffer_apply_numa_hints(coffer_model_hint_t* hint) {
-    if (numa_available() < 0) {
-        fprintf(stderr, "Coffer: NUMA not available, skipping placement\n");
+    const coffers_topology_t* topo = coffers_topology();
+    coffers_report_mode();
+
+    if (topo->uniform) {
+        /* Nothing to spread: one uniform region. Not an error. */
+        fprintf(stderr, "Coffer: uniform memory - no node placement needed\n");
         return 0;
     }
+
+    int n_nodes = topo->n_nodes;
 
     fprintf(stderr, "\n");
     fprintf(stderr, "╔═══════════════════════════════════════════════════════════╗\n");
     fprintf(stderr, "║  Coffer NUMA Hints Applied                                ║\n");
     fprintf(stderr, "╠═══════════════════════════════════════════════════════════╣\n");
 
-    /* Divide weights among NUMA nodes */
-    size_t per_node = hint->weights_size / 4;
+    /* Divide weights among the NUMA nodes that actually exist */
+    size_t per_node = hint->weights_size / (size_t)n_nodes;
     uint8_t* base = (uint8_t*)hint->weights_base;
 
-    for (int node = 0; node < 4; node++) {
-        size_t offset = node * per_node;
-        size_t size = (node == 3) ? (hint->weights_size - offset) : per_node;
+    for (int node = 0; node < n_nodes; node++) {
+        size_t offset = (size_t)node * per_node;
+        size_t size = (node == n_nodes - 1) ? (hint->weights_size - offset) : per_node;
 
         if (coffer_migrate_region(base + offset, size, node) >= 0) {
             fprintf(stderr, "║  Node %d: %8.2f GB (offset %zu)                       ║\n",
@@ -407,7 +416,6 @@ static inline void coffer_prefetch_layer_weights(
     coffer_mmap_ctx_t* ctx,
     int layer_id
 ) {
-#if defined(__powerpc64__) || defined(__powerpc__)
     for (int i = 0; i < ctx->n_tensors; i++) {
         coffer_tensor_info_t* t = &ctx->tensors[i];
         if (t->layer_id == layer_id && t->size_bytes > 0) {
@@ -415,19 +423,19 @@ static inline void coffer_prefetch_layer_weights(
             const uint8_t* addr = (const uint8_t*)ctx->mapped_addr +
                                   ctx->tensor_data_offset + t->offset;
 
-            /* Prefetch every 128 bytes (cache line) */
-            size_t prefetch_stride = 128;
+            /* Prefetch one touch per cache line (128B POWER8, 64B elsewhere) */
+            size_t prefetch_stride = COFFERS_CACHE_LINE;
             size_t prefetch_count = t->size_bytes / prefetch_stride;
 
             /* Limit prefetch to first 1MB to avoid cache thrashing */
-            if (prefetch_count > 8192) prefetch_count = 8192;
+            size_t max_lines = (1024 * 1024) / prefetch_stride;
+            if (prefetch_count > max_lines) prefetch_count = max_lines;
 
             for (size_t j = 0; j < prefetch_count; j++) {
-                __asm__ __volatile__("dcbt 0,%0" : : "r"(addr + j * prefetch_stride));
+                coffers_prefetch(addr + j * prefetch_stride);
             }
         }
     }
-#endif
 }
 
 /*===========================================================================

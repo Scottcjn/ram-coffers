@@ -20,6 +20,9 @@
  * PSE COMPONENT INCLUDES
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Capability detection - must come first */
+#include "coffers-portability.h"
+
 /* Core PSE components */
 #include "power8-compat.h"
 #include "ggml-intelligent-collapse.h"
@@ -27,11 +30,25 @@
 #include "ggml-topk-collapse-vsx.h"
 #include "pse-entropy-burst.h"
 #include "ggml-ram-coffers.h"
-#include "ggml-dcbt-resident.h"
-#include "ggml-sparse-softmax.h"  /* Skip-before-softmax pruning */  /* L2/L3 resident prefetch - THE 147 t/s enabler! */
 
-/* PowerLISP Symbolic Integration (NEW!) */
-#include "ggml-pse-symbolic-gate.h"
+/*
+ * The headers below are NOT present in this repository - they live only in
+ * the private llama.cpp integration tree. Including them unconditionally
+ * made this umbrella header impossible to compile from a clean checkout, on
+ * POWER as much as anywhere else. Guard them so the header degrades to the
+ * components that ARE published here.
+ */
+#if __has_include("ggml-dcbt-resident.h")
+#  include "ggml-dcbt-resident.h"      /* L2/L3 resident prefetch - the 147 t/s enabler */
+#endif
+#if __has_include("ggml-sparse-softmax.h")
+#  include "ggml-sparse-softmax.h"     /* Skip-before-softmax pruning */
+#endif
+
+/* PowerLISP Symbolic Integration */
+#if __has_include("ggml-pse-symbolic-gate.h")
+#  include "ggml-pse-symbolic-gate.h"
+#endif
 #include "ggml-neuromorphic-coffers.h"
 #include "ggml-symbolic-neural-bridge.h"
 

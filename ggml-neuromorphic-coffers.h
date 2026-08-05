@@ -65,12 +65,20 @@ extern int activate_coffer_ex(int coffer_id, int n_layers);
  * Four-state epistemic truth for confidence-weighted routing
  *===========================================================================*/
 
+/*
+ * Guarded because ggml-symbolic-neural-bridge.h defines the identical enum
+ * behind TETRA_T_DEFINED. Including both headers (as ggml-pse-integration.h
+ * does) previously produced a redefinition error under C++.
+ */
+#ifndef TETRA_T_DEFINED
+#define TETRA_T_DEFINED
 typedef enum {
     TETRA_FALSE    = 0,   /* Known false, 0.0 */
     TETRA_POSSIBLE = 1,   /* Uncertain, 0.33 */
     TETRA_LIKELY   = 2,   /* Probable, 0.66 */
     TETRA_CERTAIN  = 3    /* Known true, 1.0 */
 } tetra_t;
+#endif
 
 static inline float tetra_to_float(tetra_t t) {
     static const float TETRA_VALUES[4] = {0.0f, 0.333f, 0.666f, 1.0f};

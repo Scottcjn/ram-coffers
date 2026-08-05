@@ -28,7 +28,7 @@
 #ifndef GGML_VCIPHER_COLLAPSE_H
 #define GGML_VCIPHER_COLLAPSE_H
 
-#include <altivec.h>
+#include "coffers-portability.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -58,14 +58,18 @@
 
 /*===========================================================================
  * Hardware Timebase Entropy
+ *
+ * This used to be an UNGUARDED `mftb` inline asm, which is a POWER-only
+ * instruction and therefore an assembler error on every other architecture.
+ * coffers_read_timebase() emits exactly that same `mftb` on POWER and falls
+ * back to CLOCK_MONOTONIC elsewhere, so POWER behaviour is unchanged.
  *===========================================================================*/
 
 static inline uint64_t vc_read_tb(void) {
-    uint64_t tb;
-    __asm__ __volatile__("mftb %0" : "=r"(tb));
-    return tb;
+    return coffers_read_timebase();
 }
 
+#if GGML_COFFERS_HAVE_VCIPHER
 /*===========================================================================
  * vcipher Round Key from Entropy
  *
@@ -462,5 +466,323 @@ static inline void vcipher_collapse_banner(void) {
     fprintf(stderr, "   Pipeline:         8-way (fills 7-cycle vcipher latency)\n");
     fprintf(stderr, "════════════════════════════════════════════════════════════\n");
 }
+
+#else /* !GGML_COFFERS_HAVE_VCIPHER */
+
+/*===========================================================================
+ * SCALAR FALLBACK PATH
+ *
+ * Selected on any target without POWER ISA 2.07 crypto: x86-64, aarch64, or
+ * a PowerPC build without -mcrypto. Everything below has the same public
+ * entry points as the vcipher path so callers compile and link unchanged.
+ *
+ * THIS PATH IS BEHAVIOURALLY EQUIVALENT IN INTENT BUT **NOT BIT-IDENTICAL**
+ * TO THE vcipher PATH, and is not expected to be. On POWER the AES round
+ * function (SubBytes + ShiftRows + MixColumns + AddRoundKey) *is* the
+ * entropy and diffusion source; there is no portable instruction that
+ * reproduces it. Here that role is played by a software xorshift/multiply
+ * avalanche mixer seeded from coffers_read_timebase().
+ *
+ * What IS preserved is the logical intent:
+ *   - entropy-seeded, non-linear pattern generation
+ *   - top-K selection
+ *   - amplification of winners, zeroing of losers
+ *   - cross-lane ("cross-head") diffusion when VCIPHER_CROSS_HEAD_FUSE is on
+ *
+ * The numeric outputs differ from the AES path. Do not compare them.
+ *===========================================================================*/
+
+/* 64-bit avalanche mixer. Software stand-in for the S-box non-linearity:
+ * a 1-bit input change flips ~half the output bits. */
+static inline uint64_t vc_mix64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xFF51AFD7ED558CCDULL;
+    x ^= x >> 33;
+    x *= 0xC4CEB9FE1A85EC53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+/* Scalar analogue of vc_make_round_key(): the same two entropy-seeded halves,
+ * held in a plain array instead of a 128-bit vector. */
+static inline void vc_make_round_key_s(int layer_id, int position, uint64_t rk[2]) {
+    uint64_t tb = vc_read_tb();
+    rk[0] = tb ^ ((uint64_t)layer_id * 0x9E3779B97F4A7C15ULL);
+    rk[1] = tb ^ ((uint64_t)position * 0x517CC1B727220A95ULL);
+}
+
+/* One round: AddRoundKey + non-linear mixing, plus optional cross-half
+ * diffusion standing in for MixColumns (mix_across = 0 emulates the
+ * "last round", which omits MixColumns). */
+static inline void vc_round_s(uint64_t st[2], const uint64_t rk[2], int mix_across) {
+    st[0] = vc_mix64(st[0] ^ rk[0]);
+    st[1] = vc_mix64(st[1] ^ rk[1]);
+    if (mix_across) {
+        uint64_t a = st[0], b = st[1];
+        st[0] = vc_mix64(a ^ (b << 13) ^ (b >> 7));
+        st[1] = vc_mix64(b ^ (a << 17) ^ (a >> 11));
+    }
+}
+
+/* coffers_perm_t is a 16-byte object on every target (a vector on AltiVec,
+ * a byte struct otherwise), so memcpy is the one portable way in and out. */
+static inline coffers_perm_t vc_perm_from_bytes(const unsigned char b[16]) {
+    coffers_perm_t p;
+    memcpy(&p, b, 16);
+    return p;
+}
+
+static inline void vc_perm_to_bytes(coffers_perm_t p, unsigned char b[16]) {
+    memcpy(b, &p, 16);
+}
+
+/*---------------------------------------------------------------------------
+ * MODE 1 (scalar): entropy-seeded non-linear pattern generation
+ *-------------------------------------------------------------------------*/
+
+static inline coffers_perm_t vcipher_generate_pattern(
+    int layer_id, int position, int top_k
+) {
+    if (top_k < 1)  top_k = 1;
+    if (top_k > 16) top_k = 16;
+
+    uint64_t st[2];
+    st[0] = (uint64_t)layer_id * 0x6A09E667F3BCC908ULL;
+    st[1] = (uint64_t)position * 0xBB67AE8584CAA73BULL;
+
+    for (int r = 0; r < VCIPHER_COLLAPSE_ROUNDS; r++) {
+        uint64_t rk[2];
+        vc_make_round_key_s(layer_id + r, position, rk);
+        vc_round_s(st, rk, 1);
+    }
+    /* Final round without cross-half diffusion, mirroring vcipherlast. */
+    uint64_t final_rk[2];
+    vc_make_round_key_s(layer_id, position + 1, final_rk);
+    vc_round_s(st, final_rk, 0);
+
+    unsigned char raw[16];
+    memcpy(raw, st, 16);
+
+    unsigned char pattern[16];
+    /* First top_k slots: identity mapping (preserve winners in position) */
+    for (int i = 0; i < top_k; i++) {
+        pattern[i] = (unsigned char)i;
+    }
+    /* Remaining slots: non-linear duplication of top winners */
+    for (int i = top_k; i < 16; i++) {
+        pattern[i] = (unsigned char)(raw[i] % (unsigned)top_k);
+    }
+
+    return vc_perm_from_bytes(pattern);
+}
+
+/*---------------------------------------------------------------------------
+ * MODE 2 (scalar): score ranking keys
+ *-------------------------------------------------------------------------*/
+
+static inline void vcipher_rank_scores(
+    const float* scores,     /* Input: attention scores (4 floats = 16 bytes) */
+    uint8_t* rank_keys,      /* Output: 16-byte ranking keys */
+    int layer_id,
+    int position
+) {
+    uint64_t st[2];
+    memcpy(st, scores, 16);
+
+    uint64_t rk[2];
+    vc_make_round_key_s(layer_id, position, rk);
+
+#if VCIPHER_CROSS_HEAD_FUSE
+    vc_round_s(st, rk, 1);   /* cross-half mixing == cross-head influence */
+#else
+    vc_round_s(st, rk, 0);   /* each score ranked independently */
+#endif
+
+    memcpy(rank_keys, st, 16);
+}
+
+/*---------------------------------------------------------------------------
+ * MODE 3 (scalar): cross-head fusion
+ *
+ * The POWER version takes and returns `vector unsigned long long`. That type
+ * does not exist portably, so the scalar version uses coffers_perm_t as the
+ * 128-bit state container; it is 16 bytes on every target.
+ *-------------------------------------------------------------------------*/
+
+static inline coffers_perm_t vcipher_fuse_heads(
+    coffers_perm_t head_scores,
+    int layer_id, int position
+) {
+    unsigned char b[16];
+    vc_perm_to_bytes(head_scores, b);
+
+    uint64_t st[2];
+    memcpy(st, b, 16);
+
+    uint64_t rk[2];
+    vc_make_round_key_s(layer_id, position, rk);
+    vc_round_s(st, rk, 1);   /* cross-half diffusion == MixColumns fusion */
+
+    memcpy(b, st, 16);
+    return vc_perm_from_bytes(b);
+}
+
+/*---------------------------------------------------------------------------
+ * 8-Way Collapse (scalar)
+ *
+ * No pipelining benefit to chase here, so the loop simply keeps the same
+ * grouping and the same per-group round-key seeding as the POWER version,
+ * and applies the same prune/amplify decision to every vector in the group.
+ *-------------------------------------------------------------------------*/
+
+static inline void vcipher_collapse_8way(
+    float* scores,           /* Array of score vectors (each 16 bytes / 4 floats) */
+    int n_vectors,           /* Number of 4-float vectors to process */
+    int layer_id,
+    int position
+) {
+    const float amp = VCIPHER_COLLAPSE_AMPLIFY;
+
+    int i = 0;
+    for (; i + 7 < n_vectors; i += 8) {
+        for (int v = 0; v < 8; v++) {
+            uint64_t st[2];
+            memcpy(st, &scores[(i + v) * 4], 16);
+
+            /* Same seeding as rk0..rk7 on the POWER path. */
+            uint64_t rk[2];
+            vc_make_round_key_s(layer_id + (v >> 2), position + (v & 3), rk);
+            vc_round_s(st, rk, 1);
+
+            unsigned char r[16];
+            memcpy(r, st, 16);
+
+            for (int j = 0; j < 4; j++) {
+                int idx = (i + v) * 4 + j;
+                uint16_t energy = (uint16_t)(r[j] + r[j + 4] + r[j + 8]);
+                if (energy < 384) scores[idx] = 0.0f;   /* Prune  */
+                else              scores[idx] *= amp;   /* Amplify */
+            }
+        }
+    }
+}
+
+/*---------------------------------------------------------------------------
+ * CORE (scalar): hybrid collapse
+ *
+ * Step 1 (top-K threshold) is identical in logic to the POWER path: there,
+ * selection is driven by the score values themselves, so nothing is lost.
+ * Step 3 routes whole floats rather than bytes — byte-level permutation of
+ * IEEE-754 floats is only meaningful as a lane shuffle, so the scalar path
+ * shuffles lanes directly.
+ *-------------------------------------------------------------------------*/
+
+static inline void vcipher_hybrid_collapse(
+    float* scores,
+    int n,
+    int top_k,
+    int layer_id,
+    int position
+) {
+    if (n < 4) return;
+    if (top_k < 1)  top_k = 1;
+    if (top_k > 16) top_k = 16;
+
+    /* Step 1: find the top-K threshold. */
+    float top_vals[16];
+    for (int i = 0; i < 16; i++) top_vals[i] = -1e30f;
+
+    for (int i = 0; i + 3 < n; i += 4) {
+        for (int j = 0; j < 4; j++) {
+            float score = scores[i + j];
+            if (score > top_vals[top_k - 1]) {
+                top_vals[top_k - 1] = score;
+                /* Bubble sort into position */
+                for (int k = top_k - 1; k > 0 && top_vals[k] > top_vals[k-1]; k--) {
+                    float tmp = top_vals[k]; top_vals[k] = top_vals[k-1]; top_vals[k-1] = tmp;
+                }
+            }
+        }
+    }
+    float threshold = top_vals[top_k - 1];
+
+    /* Step 2: entropy-seeded permute pattern (winners duplicated). */
+    unsigned char pb[16];
+    vc_perm_to_bytes(vcipher_generate_pattern(layer_id, position, top_k), pb);
+
+    /* Step 3: route, then amplify winners / zero losers. */
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        float src[16], dst[16];
+        memcpy(src, &scores[i], 16 * sizeof(float));
+
+        for (int j = 0; j < 16; j++) dst[j] = src[pb[j] & 15];
+        for (int j = 0; j < 16; j++) {
+            dst[j] = (dst[j] > threshold) ? dst[j] * VCIPHER_COLLAPSE_AMPLIFY : 0.0f;
+        }
+
+        memcpy(&scores[i], dst, 16 * sizeof(float));
+    }
+
+    /* Scalar remainder */
+    for (; i < n; i++) {
+        if (scores[i] >= threshold) scores[i] *= VCIPHER_COLLAPSE_AMPLIFY;
+        else                        scores[i] = 0.0f;
+    }
+}
+
+/*---------------------------------------------------------------------------
+ * MODE 4 (scalar): non-linear Q/K similarity score
+ *-------------------------------------------------------------------------*/
+
+static inline uint32_t vcipher_attention_score(
+    const float* Q_vec,      /* 4 floats of query */
+    const float* K_vec,      /* 4 floats of key */
+    int layer_id, int position
+) {
+    uint64_t q[2], k[2];
+    memcpy(q, Q_vec, 16);
+    memcpy(k, K_vec, 16);
+
+    /* XOR Q and K at byte level — similar vectors → near-zero XOR */
+    uint64_t st[2] = { q[0] ^ k[0], q[1] ^ k[1] };
+
+    uint64_t rk[2];
+    vc_make_round_key_s(layer_id, position, rk);
+    vc_round_s(st, rk, 1);
+
+    unsigned char bytes[16];
+    memcpy(bytes, st, 16);
+
+    uint32_t energy = 0;
+    for (int i = 0; i < 16; i++) energy += bytes[i];
+
+    /* Invert: low energy = high similarity = high score */
+    return 4080 - energy;  /* Max possible energy = 16*255 = 4080 */
+}
+
+/*---------------------------------------------------------------------------
+ * Banner (scalar)
+ *-------------------------------------------------------------------------*/
+
+static inline void vcipher_collapse_banner(void) {
+    fprintf(stderr, "\n");
+    fprintf(stderr, "════════════════════════════════════════════════════════════\n");
+    fprintf(stderr, "  PSE vcipher Collapse — SCALAR FALLBACK (no POWER crypto)\n");
+    fprintf(stderr, "────────────────────────────────────────────────────────────\n");
+    fprintf(stderr, "   Mixing rounds:    %d (software xorshift-multiply avalanche)\n",
+            VCIPHER_COLLAPSE_ROUNDS);
+    fprintf(stderr, "   Top-K:            %d\n", VCIPHER_COLLAPSE_TOP_K);
+    fprintf(stderr, "   Amplify:          %.2f\n", (double)VCIPHER_COLLAPSE_AMPLIFY);
+    fprintf(stderr, "   Cross-head fuse:  %s (software cross-half diffusion)\n",
+            VCIPHER_CROSS_HEAD_FUSE ? "ENABLED" : "disabled");
+    fprintf(stderr, "   Entropy source:   %s\n",
+            GGML_COFFERS_IS_POWER ? "mftb timebase" : "CLOCK_MONOTONIC");
+    fprintf(stderr, "   Pipeline:         n/a (no vcipher on this target)\n");
+    fprintf(stderr, "   NOTE: intent-equivalent to the vcipher path, NOT bit-identical.\n");
+    fprintf(stderr, "════════════════════════════════════════════════════════════\n");
+}
+
+#endif /* GGML_COFFERS_HAVE_VCIPHER */
 
 #endif /* GGML_VCIPHER_COLLAPSE_H */

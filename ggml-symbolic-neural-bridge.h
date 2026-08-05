@@ -46,6 +46,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
+#include <time.h>   /* time() is used below; was relied on transitively */
 
 /*===========================================================================
  * Tetranary Logic (from PowerLISP)

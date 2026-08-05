@@ -204,7 +204,63 @@ Requires `-mcrypto` for `__builtin_crypto_vcipher()` / `__builtin_crypto_vcipher
 | `power8-compat.h` | POWER9→POWER8 intrinsic compatibility layer |
 | `ggml-neuromorphic-coffers.h` | Brain hemisphere → NUMA cognitive routing |
 | `ggml-symbolic-neural-bridge.h` | PowerLISP ↔ neural integration |
+| **`coffers-portability.h`** | **Capability detection + NUMA/intrinsic fallback shims** |
 | **`apple-silicon/`** | **Apple Silicon PSE port — NEON + AES + unified memory coffers** |
+
+## Building on non-POWER / non-NUMA systems
+
+RAM Coffers targets the IBM POWER8 S824, but it **builds and runs anywhere** —
+x86-64 laptops, single-socket servers, ARM boxes, and hosts without
+`libnuma-dev` installed. You do not need NUMA, and you do not need POWER.
+
+```bash
+# Ordinary x86-64 machine, libnuma installed
+gcc -std=c11 -I. -Wall tests/test_portability.c -o tp -lm -lnuma && ./tp
+
+# No libnuma at all? Force uniform-memory mode:
+gcc -std=c11 -I. -Wall -DGGML_COFFERS_NO_NUMA tests/test_portability.c -o tp -lm && ./tp
+
+# Full build matrix across every capability combination
+cd tests && ./build_matrix.sh
+```
+
+### What happens without NUMA
+
+When libnuma is absent, or present but reporting a single node, the system
+initialises **one coffer covering all memory** and carries on. This is a
+supported configuration, not an error:
+
+```
+RAM Coffers: NUMA unavailable - running in uniform-memory mode (1 coffer)
+RAM Coffers: vector path = scalar C, prefetch = __builtin_prefetch, entropy = CLOCK_MONOTONIC
+```
+
+Routing, prune planning, prefetch and shard loading all still work — there is
+simply no node affinity to exploit. Node-placement calls become successful
+no-ops rather than failures.
+
+### Capability macros
+
+| Macro | Auto-detected when | Override |
+|---|---|---|
+| `GGML_COFFERS_HAVE_NUMA` | Linux + `<numa.h>` present | `-DGGML_COFFERS_NO_NUMA` |
+| `GGML_COFFERS_HAVE_ALTIVEC` | POWER + `-maltivec` + `<altivec.h>` | `-DGGML_COFFERS_NO_ALTIVEC` |
+| `GGML_COFFERS_HAVE_VCIPHER` | AltiVec + `__CRYPTO__` | `-DGGML_COFFERS_HAVE_VCIPHER=0` |
+
+NUMA is **on by default** wherever it is available — it is not opt-in, so
+POWER8 behaviour is unchanged.
+
+### Scalar fallbacks
+
+| POWER feature | Portable equivalent |
+|---|---|
+| `dcbt` prefetch | `__builtin_prefetch`, else no-op |
+| `mftb` timebase entropy | `clock_gettime(CLOCK_MONOTONIC)` |
+| `vec_perm` collapse | plain C byte permute — same logical result |
+| `vcipher` (hardware AES) | software avalanche mixer — same intent, not bit-identical |
+
+Full details, the verified build matrix, and known pre-existing limitations
+are in [`PORTABILITY.md`](PORTABILITY.md).
 
 ## Apple Silicon Port (NEW — March 2026)
 
