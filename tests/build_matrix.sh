@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
+
+# Run from anywhere: anchor to this script's directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 #
 # build_matrix.sh - Verify RAM Coffers builds and runs across capability modes.
 #
-# Run from the tests/ directory:  ./build_matrix.sh
+# Run from anywhere:  bash tests/build_matrix.sh   (or ./build_matrix.sh from tests/)
 #
 # Modes exercised:
 #   1. auto-detect                (whatever this machine has)
