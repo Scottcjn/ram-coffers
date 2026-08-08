@@ -14,13 +14,13 @@ small coffer hierarchy:
     PS5 Pro         16 GB @ 576 GB/s  + 2 GB DDR5 OS-only + 5.5 GB/s NVMe
 
 The same silicon is also sold *outside* a console shell, harvested harder: the
-AMD 4700S/4800S desktop kits are Series X SoCs with the GPU fused off entirely
-and the 16 GB GDDR6 soldered to an ITX board, and the BC-250 blade is a PS5
-Oberon/Cyan Skillfish part with 6 of 8 CPU cores and 24 of 40 CUs enabled by the
-driver. Those boards are the cheapest way to add capacity to a fleet, they run a
-normal Linux, and the BC-250 in particular is the only member of the family with
-a *routinely exercised* GPU compute path — so they are first-class SKUs here,
-not a footnote.
+AMD 4700S desktop kit is a PS5 "Ariel" SoC and the 4800S a Series X one, both
+with the GPU fused off entirely and 16 GB of GDDR6 soldered to the board as
+system memory, and the BC-250 blade is a PS5 Oberon/Cyan Skillfish part with 6
+of 8 CPU cores and 24 of 40 CUs enabled by the driver. Those boards are the
+cheapest way to add capacity to a fleet, they run a normal Linux, and the BC-250
+in particular is the only member of the family with a *routinely exercised* GPU
+compute path — so they are first-class SKUs here, not a footnote.
 
 Two things this module exists to get right:
 
@@ -428,29 +428,40 @@ XBOX_SERIES_S = ConsoleSKU(
 AMD_4700S = ConsoleSKU(
     sku="amd-4700s",
     family="salvage",
-    marketing_name="AMD 4700S Desktop Kit (Series X SoC, GPU fused off)",
-    cpu_cores=8, cpu_threads=16, cpu_ghz=4.0,
-    cu_physical=56, cu_enabled=0, gpu_ghz=0.0, gpu_tflops_fp32=0.0,
-    # 16 GB GDDR6 soldered to the board and used as system memory. The DRAM is
-    # the console's, but the CPU reaches it through a fabric never meant to be
-    # the only client: measured desktop throughput and latency are far short of
-    # the console's 560 GB/s figure (UNVERIFIED; budgeted at a fifth of it,
-    # which is still several times a DDR4 desktop).
-    tiers=(MemoryTier("gddr6", 16 * GB, 112.0, 1 * GB),),
-    storage=StorageSpec(capacity_bytes=512 * GB, read_gbps=3.5),
+    marketing_name="AMD 4700S Desktop Kit (PS5 'Ariel' SoC, GPU fused off)",
+    cpu_cores=8, cpu_threads=16, cpu_ghz=3.2,
+    cu_physical=40, cu_enabled=0, gpu_ghz=0.0, gpu_tflops_fp32=0.0,
+    # 16 GB GDDR6 (8 SK hynix packages, 256-bit, 14 Gbps) soldered to the board
+    # and used as system memory. The DRAM is the console's, but the CPU reaches
+    # it through a fabric never meant to be its only client: 92.9 GB/s AIDA64
+    # copy, against the PS5 GPU's 448 GB/s, at 145 ns rather than DDR4's 74 ns
+    # (MEASURED by Tom's Hardware on a retail kit, not by us). Latency that high
+    # is survivable here because expert GEMV reads are sequential.
+    tiers=(MemoryTier("gddr6", 16 * GB, 92.0, 1 * GB),),
+    # SATA only: the board has no M.2 and the sole PCIe slot may not be spent on
+    # a carrier card, so the cold tier is a 6 Gb/s SSD, not an NVMe.
+    storage=StorageSpec(capacity_bytes=512 * GB, read_gbps=0.55),
     backends=(ComputeBackend.CPU_AVX2,),
     board_revisions=("4700s-itx",),
     notes="GPU permanently disabled, so this is a pure CPU node with an unusual "
           "amount of bandwidth-rich memory: the natural host for cold routed "
-          "experts. A PCIe x16 slot exists but no discrete GPU is assumed.",
+          "experts. The slot is x16 mechanically but PCIe 2.0 x4 electrically "
+          "(~2 GB/s), too narrow to feed a card's VRAM from board memory; a "
+          "card added here is a compute unit for what already fits in it.",
 )
 
 AMD_4800S = replace(
     AMD_4700S, sku="amd-4800s",
-    marketing_name="AMD 4800S Desktop Kit (Series X SoC, GPU fused off)",
+    marketing_name="AMD 4800S Desktop Kit (Xbox Series X SoC, GPU fused off)",
+    cpu_ghz=4.0, cu_physical=56,
+    # Same memory arrangement, but the board is mATX with an M.2 for storage and
+    # a PCIe 4.0 x4 slot (~7.9 GB/s) instead of the 4700S's Gen2 x4.
+    storage=StorageSpec(capacity_bytes=512 * GB, read_gbps=3.5),
     board_revisions=("4800s-matx",),
-    notes="Later mATX revision of the same harvest, sold through OEMs. Same "
-          "CPU-only capability model as the 4700S.",
+    notes="The later kit is a different harvest, not a revision: Series X "
+          "silicon rather than the 4700S's PS5 Ariel, clocked to 4.0 GHz, with "
+          "an M.2 and a Gen4 x4 slot. Same CPU-only capability model, but the "
+          "wider slot is what makes a discrete card worth considering.",
 )
 
 BC_250 = ConsoleSKU(

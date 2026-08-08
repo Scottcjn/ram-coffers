@@ -103,8 +103,21 @@ figures in `hardware.py` are marked `UNVERIFIED` where that is the case.
   routinely exercised, hence its role in the fleet as the sanity check for the
   Vulkan path.
 - AMD 4700S / 4800S desktop kits: console SoCs with the GPU fused off, GDDR6 as
-  system memory at greatly reduced effective bandwidth. Modelled as CPU-only
-  nodes with a large slow coffer.
+  system memory at greatly reduced effective bandwidth. Different harvests, not
+  revisions of each other — the 4700S is a PS5 "Ariel" die
+  ([Tom's Hardware teardown](https://www.tomshardware.com/reviews/amd-4700s-desktop-kit-review-ps5-cpu),
+  which also measures the GDDR6 at 92.9 GB/s copy and 145 ns), the 4800S a
+  Series X one
+  ([Digital Foundry](https://www.digitalfoundry.net/articles/digitalfoundry-2023-amd-4800s-desktop-kit-review-play-pc-games-on-the-xbox-series-x-cpu)).
+  Modelled as CPU-only nodes with a large slow coffer.
+
+  A card in the slot does not make either one a small PS5. Both slots are x4:
+  PCIe 2.0 x4 (~2 GB/s) on the 4700S, PCIe 4.0 x4 (~7.9 GB/s) on the 4800S. A
+  GPU there can only run experts that fit in its own VRAM, because reaching the
+  board's 15 GB across that link is two orders of magnitude slower than the
+  console memory the design assumes. Supporting it properly needs a memory model
+  where a tier's bandwidth depends on which backend is reading it — the same
+  change the Steam Machine's split GDDR6/DDR5 would need, and not yet made.
 
 ## Compute backends
 

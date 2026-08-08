@@ -55,8 +55,8 @@ One member of each shelf is the **host**. It holds, for that shelf's layers:
 - the layer norms.
 
 A host must have both the room and ≥200 GB/s (`HOT_BANDWIDTH_FLOOR_GBPS`). That
-floor is why a 4700S — same silicon as a Series X, GPU fused off, ~112 GB/s —
-can hold cold experts but is never chosen as a host.
+floor is why a 4700S — a PS5 die with the GPU fused off, its GDDR6 measuring
+92.9 GB/s from the CPU — can hold cold experts but is never chosen as a host.
 
 The MLA compressed KV cache is what makes an 8k context affordable: rank 512
 instead of 160 full heads is ~9 MiB per layer per 8k tokens rather than ~160.

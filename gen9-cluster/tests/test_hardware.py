@@ -35,11 +35,27 @@ class TestSKUs(unittest.TestCase):
             self.assertIn(name, SKUS)
 
     def test_4700s_has_no_usable_gpu(self):
-        """The 4700S is a Series X SoC sold as a desktop kit with the GPU fused
-        off. Planning it as if it had 52 CUs would be a 40x error."""
+        """The 4700S is a PS5 Ariel die sold as a desktop kit with the GPU fused
+        off. Planning it as if it had 36 CUs would be a 40x error."""
         cap = ConsoleUnit("kit", "amd-4700s", Runtime.SALVAGE_LINUX).effective()
         self.assertEqual(cap.cu_active, 0)
         self.assertEqual(cap.backend, ComputeBackend.CPU_AVX2)
+
+    def test_the_two_kits_are_different_harvests(self):
+        """The 4800S is not a revision of the 4700S: PS5 Ariel silicon against
+        Series X silicon, and a SATA-only board against one with an M.2. Both
+        distinctions reach the planner, so neither may be collapsed."""
+        kit47, kit48 = sku_for("amd-4700s"), sku_for("amd-4800s")
+        self.assertEqual(kit47.cu_physical, 40)
+        self.assertEqual(kit48.cu_physical, 56)
+        self.assertLess(kit47.storage.effective_read_gbps,
+                        kit48.storage.effective_read_gbps)
+
+    def test_neither_kit_can_host_a_shelf(self):
+        """Their GDDR6 is fast for system memory and far short of a console's,
+        which is the entire reason they are capacity nodes and not hosts."""
+        for name in ("amd-4700s", "amd-4800s"):
+            self.assertLess(sku_for(name).fast_tier.bandwidth_gbps, 200.0, name)
 
 
 class TestDownbin(unittest.TestCase):

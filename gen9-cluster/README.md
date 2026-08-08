@@ -34,9 +34,9 @@ anyway:
    experts per layer. The other 96% only has to be *stored*, and storage is the
    one thing a pile of consoles has.
 2. **Decode is bandwidth-bound, not compute-bound.** A PS5's 448 GB/s is what
-   matters, and it is a genuinely good number — a 4700S with the same silicon
-   but the GPU fused off is limited to about a quarter of it, and the planner
-   knows the difference.
+   matters, and it is a genuinely good number — a 4700S carries the same DRAM
+   on the same 256-bit bus, but reaching it from the CPU instead of the GPU
+   measures 92.9 GB/s, a fifth as much, and the planner knows the difference.
 3. **FP8 is the native format.** One byte per parameter, with a scale per
    128-element block, halves the console count against BF16 and roughly doubles
    the token rate. `kernels/fp8.c` and `gen9_cluster/fp8.py` implement E4M3FN
@@ -85,7 +85,8 @@ An inventory records what each *specific* unit actually has:
 | PS5 Pro | 64 / 60 | 16 GB @ 576 GB/s | 2 GB DDR5 (OS) | 5.5 GB/s |
 | Xbox Series X | 56 / 52 | 10 GB @ 560 GB/s | 6 GB @ 336 GB/s | 2.4 GB/s |
 | Xbox Series S | 24 / 20 | 8 GB @ 224 GB/s | 2 GB @ 56 GB/s | 2.4 GB/s |
-| AMD 4700S / 4800S | 56 / **0** | 16 GB @ ~112 GB/s | — | host NVMe |
+| AMD 4700S | 40 / **0** | — | 15 GB @ 92 GB/s | SATA 0.55 GB/s |
+| AMD 4800S | 56 / **0** | — | 15 GB @ 92 GB/s | 3.5 GB/s |
 | BC-250 | 40 / 24 (40 with override) | 16 GB @ 448 GB/s | — | host NVMe |
 
 Every console in this table is *already* a downbinned part, and a real fleet
@@ -96,12 +97,16 @@ effective()` folds it into the nominal SKU, and the planner reads only the
 effective numbers — so the fleet may be arbitrarily heterogeneous and the
 planner rebalances instead of refusing.
 
-The salvage boards are worth their own note. The 4700S and 4800S are console
-SoCs with the GPU fused off entirely: CPU-only nodes, and the GDDR6 that was
-sized for a GPU becomes a large slow coffer for cold experts. The BC-250 is the
-opposite — a PS5 Oberon part with 6 of 8 cores and 24 of 40 CUs enabled, running
-ordinary Linux with amdgpu, which makes it the member of this family whose GPU
-compute path gets exercised most routinely.
+The salvage boards are worth their own note. The 4700S (a PS5 Ariel die) and the
+4800S (a Series X one) have the GPU fused off entirely: CPU-only nodes, and the
+GDDR6 that was sized for a GPU becomes a large slow coffer for cold experts. It
+is bandwidth-rich for system memory and still short of the 200 GB/s a shelf host
+needs, so a fleet of nothing but kits cannot host a shelf at all. A card in the
+slot fixes that, but only on the 4800S: the 4700S's slot is PCIe 2.0 x4, and
+~2 GB/s cannot feed a GPU from board memory. The BC-250 is the opposite — a PS5
+Oberon part with 6 of 8 cores and 24 of 40 CUs enabled, running ordinary Linux
+with amdgpu, which makes it the member of this family whose GPU compute path
+gets exercised most routinely.
 
 ## Backends, and what each can be trusted with
 
