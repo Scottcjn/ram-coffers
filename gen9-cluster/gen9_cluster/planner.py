@@ -16,7 +16,7 @@ becomes "what belongs where". This module answers it along four axes at once:
 2. **Hot/cold, by coffer.** Everything an MoE layer reads for *every* token —
    attention, the router, the shared expert, the norms — is small
    (~330 MiB at V4-Pro width) and must sit in the fastest coffer the owning
-   console has. The routed experts are ~13 GiB per layer and are read a handful
+   console has. The routed experts are ~12.9 GiB per layer and are read a handful
    at a time, so they belong in slow coffers and on NVMe. This is the RAM
    Coffers thesis applied to a memory hierarchy the console vendors built for
    their own reasons: the Series X's 560/336 GB/s split is a hot/cold boundary

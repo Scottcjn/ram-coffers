@@ -5,25 +5,25 @@ claim.
 
 ## The problem
 
-DeepSeek V4 Pro is **803 GiB** — 1.6 T parameters, but MXFP4 experts and FP8
-everywhere else come to 0.54 bytes each. The largest console in this family has
-16 GB of RAM, of which about 13 GB is reachable, so the model needs ~62
-consoles just to be *stored* and 73 once each shelf host also has to hold its
-layers' hot blocks and cache.
+DeepSeek V4 Pro is **802 GiB** — 1,599 B parameters (1,573 B excluding the MTP
+head), but MXFP4 experts and FP8 everywhere else come to 0.54 bytes each. The
+largest console in this family has 16 GB of RAM, of which about 13 GB is
+reachable, so the model needs ~62 consoles just to be *stored* and 73 once each
+shelf host also has to hold its layers' hot blocks and cache.
 
 What makes this tractable rather than absurd is that MoE decode touches almost
 none of it:
 
 | per token, per MoE layer | size |
 |---|---|
-| attention (CSA layer, incl. indexer and grouped output) | ~353 MiB |
-| attention (HCA layer) | ~290 MiB |
+| attention (CSA layer, incl. indexer and grouped output) | ~316 MiB |
+| attention (HCA layer) | ~293 MiB |
 | router + shared expert | ~36 MiB |
 | 6 routed experts of 384 | ~201 MiB |
-| **total read** | **~530-590 MiB** |
-| stored but untouched | ~12.4 GiB |
+| **total read** | **~530-555 MiB** |
+| stored but untouched | ~12.9 GiB |
 
-50 of 1600 billion parameters activate. The other 97% has to be held somewhere
+~49 B of 1,599 B parameters activate. The other 97% has to be held somewhere
 with an address, and that is precisely what a stack of consoles is good for.
 
 V4 Flash is the same architecture at a fifth of the scale — 148 GiB, 43 layers,
@@ -67,8 +67,8 @@ floor is why a 4700S — a PS5 die with the GPU fused off, its GDDR6 measuring
 Compressed attention is what makes long context affordable, and in V4 it is
 compressed along the *sequence*: a CSA layer folds every 4 tokens into one
 512-wide shared-KV entry and an HCA layer every 128, so the whole cache at a
-million tokens is 8.2 GiB rather than the 65 GiB V3's MLA would need — and at
-8k it is 74 MiB, small enough that context is not what decides the fleet size.
+million tokens is 4.6 GiB rather than the 36 GiB V3's MLA would need — and at
+8k it is 43 MiB, small enough that context is not what decides the fleet size.
 
 The two kinds are interleaved, so **neighbouring layers differ by 32x in cache
 size** and the planner sizes each block separately (`block_kv_bytes`). Sizing
@@ -100,7 +100,7 @@ Per token, the estimate sums:
 - per block: the KV the block has to *read*, which under CSA is not the KV it
   holds — the FP4 indexer scans every compressed entry but attention then reads
   only the 1024 it selected, so a million-token CSA layer reads ~17 MiB of a
-  260 MiB cache. Treating residency as the read cost would overstate
+  154 MiB cache. Treating residency as the read cost would overstate
   long-context decode by an order of magnitude,
 - per block: the slowest expert console's `expert_bytes / bandwidth`, since the
   fan-out is concurrent and the gather waits for the last reply,
@@ -118,7 +118,7 @@ Worked example, 100 PS5 + 40 Series X + 30 BC-250:
 ```
 deepseek-v4-pro on 170 consoles in 8 shelves
   context               8192 tokens
-  decode estimate       10.84 tok/s (92 ms/token)
+  decode estimate       11.14 tok/s (90 ms/token)
   consoles per layer    ~6 lit by one token
   streamed from NVMe    3.0 GiB of experts
 ```

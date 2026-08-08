@@ -130,7 +130,7 @@ class MLAConfig(AttentionConfig):
     def kind(self, layer: int = 0) -> str:
         return "mla"
 
-    def kv_cache_bytes_per_token(self, dtype: str = "bf16",
+    def kv_cache_bytes_per_token(self, dtype: str = "fp8",
                                  layer: int = 0) -> int:
         """One layer's KV cache cost for one token.
 
@@ -138,8 +138,8 @@ class MLAConfig(AttentionConfig):
         RoPE key (``qk_rope_head_dim``), shared across heads — the whole point of
         the architecture, and the reason a console can hold a long context.
         """
-        width = self.kv_lora_rank + self.qk_rope_head_dim
-        return int(round(width * DTYPE_BYTES[dtype]))
+        return int(round(self.kv_lora_rank * DTYPE_BYTES[dtype]
+                         + self.qk_rope_head_dim * DTYPE_BYTES["bf16"]))
 
     def weight_params(self, hidden_size: int, layer: int = 0) -> int:
         """Parameters in one MLA block."""
@@ -220,67 +220,80 @@ class HybridAttentionConfig(AttentionConfig):
 
     def weight_params(self, hidden_size: int, layer: int = 0) -> int:
         d, c, nh = hidden_size, self.head_dim, self.n_heads
-        kind = self.kind(layer)
+        ratio = self.ratio(layer)
         # Queries: down to d_c, then up to one c-wide query per head.
         q = d * self.q_lora_rank + self.q_lora_rank * nh * c
+        # Base KV projection: the sliding-window branch exists on every layer,
+        # including ones that also carry a compressed branch.
+        kv_base = d * c
         # Grouped output: heads within a group share an intermediate of width
         # d_g, and each group projects back to d.
         out = nh * c * self.o_group_dim + self.o_groups * self.o_group_dim * d
-        if kind == "csa":
-            # Two overlapping KV series and their compression weights, plus the
-            # learnable positional bias each compression window carries.
-            kv = 4 * d * c + 2 * self.csa_ratio * c
-            indexer = (d * self.index_n_heads * self.index_head_dim
-                       + d * self.index_head_dim + self.index_n_heads)
-        elif kind == "hca":
-            kv = 2 * d * c + self.hca_ratio * c
-            indexer = 0
-        else:
-            # No compression: one shared KV entry straight off the hidden state.
-            kv = d * c
-            indexer = 0
-        return q + kv + out + indexer
+        params = q + kv_base + out + self.q_lora_rank + c + nh
+        if ratio <= 1:
+            # Pure sliding-window attention: one KV entry, no compression.
+            return params
+        # Heavily or sparsely compressed KV: two gating projections plus a
+        # per-compression-window positional bias.  CSA uses overlapping windows.
+        coff = 2 if ratio == self.csa_ratio else 1
+        kv_compress = coff * d * c + coff * d * c + ratio * coff * c + c
+        params += kv_compress
+        if ratio == self.csa_ratio:
+            # Lightning indexer: queries from the q-lora bottleneck, per-head
+            # weights from the hidden state, and its own overlapping compressor.
+            idx_c = self.index_head_dim
+            idx_coff = 2
+            params += (self.q_lora_rank * self.index_n_heads * idx_c
+                       + d * self.index_n_heads
+                       + idx_coff * d * idx_c
+                       + idx_coff * d * idx_c
+                       + ratio * idx_coff * idx_c
+                       + idx_c)
+        return params
 
-    def kv_cache_bytes_per_token(self, dtype: str = "bf16",
+    def kv_entry_bytes(self, dtype: str = "fp8") -> float:
+        """Bytes of one cached KV entry: FP8 for the non-RoPE part, BF16 for
+        the RoPE part, matching the V4 checkpoint format."""
+        nope = self.head_dim - self.qk_rope_head_dim
+        return nope * DTYPE_BYTES[dtype] + self.qk_rope_head_dim * DTYPE_BYTES["bf16"]
+
+    def kv_cache_bytes_per_token(self, dtype: str = "fp8",
                                  layer: int = 0) -> int:
         kind = self.kind(layer)
         if kind == "swa":
             return 0  # the window is a fixed-size state, see state_bytes
-        ratio = self.csa_ratio if kind == "csa" else self.hca_ratio
-        entry = self.head_dim * DTYPE_BYTES[dtype] / ratio
+        ratio = self.ratio(layer)
+        entry = self.kv_entry_bytes(dtype) / ratio
         if kind == "csa":
             entry += (self.index_head_dim
                       * self.index_quant.bytes_per_param / ratio)
         return int(round(entry))
 
-    def state_bytes(self, dtype: str = "bf16", layer: int = 0) -> int:
+    def state_bytes(self, dtype: str = "fp8", layer: int = 0) -> int:
         """The sliding-window branch, which every layer carries.
 
         Uncompressed tail tokens live here too; both are bounded, which is why
         DeepSeek's own serving stack treats them as a fixed pool rather than as
         part of the growing cache.
         """
-        return int(round(self.sliding_window * self.head_dim
-                         * DTYPE_BYTES[dtype]))
+        return int(round(self.sliding_window * self.kv_entry_bytes(dtype)))
 
-    def kv_read_bytes(self, context_tokens: int, dtype: str = "bf16",
+    def kv_read_bytes(self, context_tokens: int, dtype: str = "fp8",
                       layer: int = 0) -> int:
         kind = self.kind(layer)
         state = self.state_bytes(dtype, layer)
         if kind == "swa":
             return state
+        ratio = self.ratio(layer)
+        entries = context_tokens / ratio
         if kind == "hca":
-            entries = context_tokens / self.hca_ratio
-            return int(round(entries * self.head_dim * DTYPE_BYTES[dtype])
-                       + state)
+            return int(round(entries * self.kv_entry_bytes(dtype) + state))
         # CSA scans every compressed entry with the FP4 indexer, then reads only
         # the top-k it selected.
-        entries = context_tokens / self.csa_ratio
         scan = (entries * self.index_head_dim
                 * self.index_quant.bytes_per_param)
         selected = min(entries, float(self.index_topk))
-        return int(round(scan + selected * self.head_dim * DTYPE_BYTES[dtype])
-                   + state)
+        return int(round(scan + selected * self.kv_entry_bytes(dtype) + state))
 
 
 @dataclass(frozen=True)
@@ -383,11 +396,49 @@ class ModelProfile:
         params = self.attention.weight_params(self.hidden_size, layer)
         return int(round(params * self.bytes_per_param))
 
+    def _hc_dim(self) -> int:
+        return self.hc_mult * self.hidden_size
+
+    def _mix_hc(self) -> int:
+        return (2 + self.hc_mult) * self.hc_mult
+
+    def _hc_params(self) -> int:
+        """Float parameters in one block's two hyper-connection mappings."""
+        return 2 * (self._mix_hc() * self._hc_dim() + self._mix_hc() + 3)
+
+    def _hc_bytes(self) -> int:
+        return int(round(self._hc_params() * self.bytes_per_param))
+
+    def _final_head_params(self) -> int:
+        params = self.hidden_size
+        if self.hc_mult > 1:
+            params += self.hc_mult * self._hc_dim() + self.hc_mult + 1
+        return params
+
+    def _final_head_bytes(self) -> int:
+        hc_params = 0
+        if self.hc_mult > 1:
+            hc_params = self.hc_mult * self._hc_dim() + self.hc_mult + 1
+        return int(round(self.hidden_size * DTYPE_BYTES["bf16"]
+                         + hc_params * self.bytes_per_param))
+
+    def _mtp_extra_params(self) -> int:
+        params = 3 * self.hidden_size
+        if self.hc_mult > 1:
+            params += self.hc_mult * self._hc_dim() + self.hc_mult + 1
+        return params
+
+    def _mtp_extra_bytes(self) -> int:
+        hc_params = 0
+        if self.hc_mult > 1:
+            hc_params = self.hc_mult * self._hc_dim() + self.hc_mult + 1
+        return int(round(3 * self.hidden_size * DTYPE_BYTES["bf16"]
+                         + hc_params * self.bytes_per_param))
+
     def router_bytes(self) -> int:
-        """Router matrix plus its bias; tiny, but read for every token."""
-        raw = (self.hidden_size * self.moe.n_routed_experts
-               + self.moe.n_routed_experts) * self.bytes_per_param
-        return int(round(raw))
+        """Router matrix; the bias/hash table is added per-layer."""
+        return int(round(self.hidden_size * self.moe.n_routed_experts
+                         * self.bytes_per_param))
 
     def dense_mlp_bytes(self) -> int:
         raw = self.moe.dense_mlp_params(self.hidden_size) * self.bytes_per_param
@@ -396,22 +447,31 @@ class ModelProfile:
     def hot_bytes_per_moe_layer(self, layer: int = 0) -> int:
         """Weights an MoE layer reads for *every* token.
 
-        Attention + router + shared expert + norms. This is the quantity that
-        must land in a fast coffer; the routed experts are the cold remainder.
-        The hyper-connection mappings are generated from the hidden state and
-        come to well under a tenth of a percent of this, so they are left out
-        rather than guessed at.
+        Attention + router + shared expert + input/post norms +
+        hyper-connections + the gate's hash table or bias. This is the quantity
+        that must land in a fast coffer; the routed experts are the cold
+        remainder.
         """
         norms = int(round(2 * self.hidden_size * DTYPE_BYTES["bf16"]))
+        gate_extras = 0
+        if layer >= self.moe.n_dense_layers:
+            if layer < self.moe.n_hash_layers:
+                gate_extras = int(round(self.vocab_size * self.moe.top_k * 4))
+            else:
+                gate_extras = int(round(self.moe.n_routed_experts
+                                        * self.bytes_per_param))
+        hc = self._hc_bytes() if self.hc_mult > 1 else 0
         return (self.attention_bytes(layer) + self.router_bytes()
-                + self.shared_expert_bytes() + norms)
+                + gate_extras + self.shared_expert_bytes()
+                + norms + hc)
 
     def cold_bytes_per_moe_layer(self) -> int:
         return self.expert_bytes() * self.moe.n_routed_experts
 
     def dense_layer_bytes(self, layer: int = 0) -> int:
         norms = int(round(2 * self.hidden_size * DTYPE_BYTES["bf16"]))
-        return self.attention_bytes(layer) + self.dense_mlp_bytes() + norms
+        hc = self._hc_bytes() if self.hc_mult > 1 else 0
+        return self.attention_bytes(layer) + self.dense_mlp_bytes() + norms + hc
 
     def embedding_bytes(self) -> int:
         return int(round(self.vocab_size * self.hidden_size
@@ -428,7 +488,7 @@ class ModelProfile:
     def mtp_hot_bytes(self, head: int = 0) -> int:
         """Per-token weights of one MTP head: its hot block plus projection."""
         return (self.hot_bytes_per_moe_layer(self.n_layers + head)
-                + self.mtp_projection_bytes())
+                + self.mtp_projection_bytes() + self._mtp_extra_bytes())
 
     def mtp_bytes(self) -> int:
         """All MTP heads, weights in full."""
@@ -446,7 +506,8 @@ class ModelProfile:
         return self.mtp_hot_bytes(index - self.n_layers)
 
     def total_bytes(self) -> int:
-        weights = self.embedding_bytes() + self.lm_head_bytes() + self.mtp_bytes()
+        weights = (self.embedding_bytes() + self.lm_head_bytes()
+                   + self._final_head_bytes() + self.mtp_bytes())
         for index in range(self.n_layers):
             if index < self.moe.n_dense_layers:
                 weights += self.dense_layer_bytes(index)
@@ -464,17 +525,28 @@ class ModelProfile:
         """
         per_expert = self.moe.expert_params() * self.hidden_size
         params = 2 * self.vocab_size * self.hidden_size
+        params += self._final_head_params()
         blocks = self.planning_layers if include_mtp else self.n_layers
         for index in range(blocks):
             attn = self.attention.weight_params(self.hidden_size, index)
+            params += attn
+            # input and post-attention RMSNorms
+            params += 2 * self.hidden_size
+            if self.hc_mult > 1:
+                params += self._hc_params()
             if index < self.moe.n_dense_layers:
-                params += attn + self.moe.dense_mlp_params(self.hidden_size)
+                params += self.moe.dense_mlp_params(self.hidden_size)
                 continue
-            params += (attn + self.hidden_size * self.moe.n_routed_experts
-                       + per_expert * (self.moe.n_routed_experts
-                                       + self.moe.n_shared_experts))
+            params += self.hidden_size * self.moe.n_routed_experts
+            if index < self.moe.n_hash_layers:
+                params += self.vocab_size * self.moe.top_k
+            else:
+                params += self.moe.n_routed_experts
+            params += per_expert * (self.moe.n_routed_experts
+                                    + self.moe.n_shared_experts)
             if index >= self.n_layers:
                 params += 2 * self.hidden_size * self.hidden_size
+                params += self._mtp_extra_params()
         return int(params)
 
     def activated_params(self) -> int:
@@ -490,31 +562,32 @@ class ModelProfile:
             if index < self.moe.n_dense_layers:
                 params += attn + self.moe.dense_mlp_params(self.hidden_size)
                 continue
-            params += attn + per_expert * (self.moe.top_k
-                                           + self.moe.n_shared_experts)
+            params += (attn + self.hidden_size * self.moe.n_routed_experts
+                       + per_expert * (self.moe.top_k
+                                       + self.moe.n_shared_experts))
         return int(params)
 
     def kv_cache_bytes_for_layer(self, layer: int, context_tokens: int,
-                                 dtype: str = "bf16") -> int:
+                                 dtype: str = "fp8") -> int:
         """Cache one layer holds for one sequence at this context length."""
         per_token = self.attention.kv_cache_bytes_per_token(dtype, layer)
         return context_tokens * per_token + self.attention.state_bytes(dtype,
                                                                        layer)
 
     def kv_read_bytes_for_layer(self, layer: int, context_tokens: int,
-                                dtype: str = "bf16") -> int:
+                                dtype: str = "fp8") -> int:
         """Cache one layer *reads* to decode one token.
 
         Equal to what it holds under dense attention, and far less under CSA.
         """
         return self.attention.kv_read_bytes(context_tokens, dtype, layer)
 
-    def kv_cache_bytes(self, context_tokens: int, dtype: str = "bf16") -> int:
+    def kv_cache_bytes(self, context_tokens: int, dtype: str = "fp8") -> int:
         return sum(self.kv_cache_bytes_for_layer(layer, context_tokens, dtype)
                    for layer in range(self.n_layers))
 
     def block_kv_bytes(self, index: int, context_tokens: int,
-                       dtype: str = "bf16") -> int:
+                       dtype: str = "fp8") -> int:
         """Cache block ``index`` holds, MTP heads included.
 
         An MTP head runs its own attention and so keeps its own cache; it is
@@ -523,7 +596,7 @@ class ModelProfile:
         return self.kv_cache_bytes_for_layer(index, context_tokens, dtype)
 
     def block_kv_read_bytes(self, index: int, context_tokens: int,
-                            dtype: str = "bf16") -> int:
+                            dtype: str = "fp8") -> int:
         return self.kv_read_bytes_for_layer(index, context_tokens, dtype)
 
     def activation_bytes(self, dtype: str = "bf16") -> int:
@@ -578,11 +651,12 @@ _V4_PRO_RATIOS: Tuple[int, ...] = tuple(
 _V4_FLASH_RATIOS: Tuple[int, ...] = tuple(
     [0, 0] + [4, 128] * 20 + [4, 0])
 
-#: DeepSeek-V4-Pro, from the published config: 1.6 T total / 49 B activated, 61
-#: layers, hidden 7168, all-MoE with 384 routed + 1 shared expert, top-6, hash
-#: gating on the first three layers, hybrid CSA (m=4, top-1024) and HCA (m'=128)
-#: attention with 128 query heads of width 512, one MTP head, hyper-connection
-#: width 4. Expert weights are MXFP4 and everything else is FP8.
+#: DeepSeek-V4-Pro, from the published config: 1,599 B total
+#: (1,573 B excluding the MTP head) / 49 B activated, 61 layers, hidden 7168,
+#: all-MoE with 384 routed + 1 shared expert, top-6, hash gating on the first
+#: three layers, hybrid CSA (m=4, top-1024) and HCA (m'=128) attention with 128
+#: query heads of width 512, one MTP head, hyper-connection width 4. Expert
+#: weights are MXFP4 and everything else is FP8.
 DEEPSEEK_V4_PRO = ModelProfile(
     name="deepseek-v4-pro",
     n_layers=61,
@@ -604,8 +678,9 @@ DEEPSEEK_V4_PRO = ModelProfile(
     source="deepseek-ai/DeepSeek-V4-Pro config.json; arXiv:2606.19348 §4.2.1",
 )
 
-#: DeepSeek-V4-Flash, from the published config: 284 B total / 13 B activated,
-#: 43 layers, hidden 4096, 256 routed + 1 shared expert, top-6, the same hybrid
+#: DeepSeek-V4-Flash, from the published config: 291 B total
+#: (284 B excluding the MTP head) / 13 B activated, 43 layers, hidden 4096,
+#: 256 routed + 1 shared expert, top-6, the same hybrid
 #: attention with 64 query heads and a 512-entry indexer top-k, and pure
 #: sliding-window attention in the first two blocks. Same mixed FP4/FP8 weights
 #: as Pro, at a fifth of the size — which is the whole reason to care about it

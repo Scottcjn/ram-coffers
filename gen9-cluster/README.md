@@ -43,7 +43,7 @@ Three properties make the fleet work anyway:
    space. `kernels/fp8.c` and `gen9_cluster/fp8.py` implement E4M3FN and are
    tested against each other over all 256 codes.
 
-The result is a plan, not a benchmark: **~10.8 tok/s estimated** for V4 Pro at
+The result is a plan, not a benchmark: **~11.1 tok/s estimated** for V4 Pro at
 8k context on 170 consoles (100 PS5 + 40 Series X + 30 BC-250), and a **73-PS5
 floor** to hold it at all. V4 Flash is a fifth of the size and fits on **20**.
 Those figures are arithmetic over memory bandwidth, network hops, and NVMe
@@ -53,8 +53,8 @@ reads. Nothing in this repository has run on a console yet.
 
 | profile | params | activated | on disk | PS5s to hold it |
 |---|---|---|---|---|
-| `deepseek-v4-pro` | 1600 B | 50 B | 803 GiB | 73 |
-| `deepseek-v4-flash` | 291 B | 14 B | 148 GiB | 20 |
+| `deepseek-v4-pro` | 1599 B | 49 B | 802 GiB | 73 |
+| `deepseek-v4-flash` | 291 B | 13 B | 148 GiB | 20 |
 | `deepseek-v3` | 683 B | 37 B | 638 GiB | 58 |
 | `deepseek-tiny` | — | — | 0.5 GiB | 1 (CI only) |
 
@@ -68,11 +68,11 @@ properties change how the planner thinks:
   every layer. Neighbouring layers therefore differ by 32x in cache size, and a
   CSA layer *reads* a small fraction of what it *holds* — so the planner sizes
   residency and decode bandwidth separately, per layer, instead of multiplying
-  one KV figure by the layer count. The whole 1 M-token cache is 8.2 GiB, about
-  a seventh of V3's.
+  one KV figure by the layer count. The whole 1 M-token cache is 4.6 GiB, about
+  an eighth of V3's.
 - **Hyper-connections.** The residual stream is 4x hidden, so a shelf boundary
   ships 56 KiB per token rather than 14. At 250 µs a hop that is still small
-  against a 92 ms token, but it is 4x what a V3-shaped model would cost.
+  against a 90 ms token, but it is 4x what a V3-shaped model would cost.
 
 ## Quick start
 
