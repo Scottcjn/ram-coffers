@@ -6,10 +6,18 @@ forces:
 * **A console holds many experts, not one.** P3XC could put the expert id in the
   header because a PS3 held exactly one. Here a node holds dozens, and a token
   routing into three of them must not cost three round trips — so
-  :class:`ExpertBatch` names a *set* of experts and their gate weights in one
-  frame, and the node returns their weighted sum as one :class:`ExpertResult`.
-  That single change is what keeps the per-layer latency at one round trip per
-  console instead of one per expert.
+  :class:`ExpertBatchPayload` names a *set* of experts and their gate weights in
+  one frame. That single change is what keeps the per-layer latency at one round
+  trip per console instead of one per expert.
+* **The reply is per-expert rows, not a partial sum.** This is P3XC's rule kept,
+  not dropped: a node returns one weighted row per expert, tagged with the
+  expert it came from (:class:`ExpertRowsPayload`), and the coordinator adds
+  them in strict top-k order. Collapsing a console's experts into one fp32 sum
+  re-associates the addition, so the same token would produce different logits
+  depending on which console happened to hold which expert — a replan would
+  silently change the output. ``Flags.FAST`` asks for the collapsed sum anyway,
+  for a caller that has decided it wants the bandwidth back; it is opt-in
+  precisely because it is the answer-changing choice.
 * **Weights are FP8 with block scales.** The dtype field therefore has to name
   ``fp8-e4m3-b128``, and a frame carrying it also carries its scale block, so a
   shard can be shipped in the format the checkpoint already uses.
@@ -27,6 +35,12 @@ matches replies to requests by that id alone, which is what allows several
 requests to be in flight on one connection: at 92 blocks per token and a quarter
 of a millisecond per hop, a strictly serial connection would spend most of a
 token's time waiting.
+
+``request_id`` is a *transport* id, scoped to one connection and reallocated on
+reconnect, so it cannot identify a retried batch. A batch that wants
+exactly-once execution carries its own 64-bit ``batch_id`` in the payload; the
+node runs it under that id and replays the first attempt's bytes to a retry
+(:mod:`gen9_cluster.dedup`).
 """
 
 from __future__ import annotations
@@ -34,12 +48,16 @@ from __future__ import annotations
 import enum
 import struct
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
 MAGIC = b"G9XC"
-VERSION = 1
+#: 2 since the reply to an ``EXPERT_BATCH`` became per-expert rows by default
+#: and the batch gained an optional ``batch_id``. Version 1 nodes and version 2
+#: coordinators disagree about the shape of every expert reply, which a version
+#: check catches at the first frame rather than as wrong logits.
+VERSION = 2
 
 #: ``magic(4) version(1) type(1) flags(2) request_id(4) layer(2) expert(2)
 #: token(4) dtype(1) rank(1) reserved(2) payload_len(4)`` = 28, padded to 32.
@@ -58,7 +76,8 @@ class MsgType(enum.IntEnum):
     HELLO_ACK = 2
     #: Coordinator -> node: run these experts on this activation.
     EXPERT_BATCH = 3
-    #: Node -> coordinator: their gate-weighted sum.
+    #: Node -> coordinator: one weighted row per expert, or their sum under
+    #: ``Flags.FAST``.
     EXPERT_RESULT = 4
     #: Coordinator -> node: run a hot block (attention + router + shared expert).
     BLOCK_FWD = 5
@@ -104,12 +123,23 @@ class DType(enum.IntEnum):
 class Flags(enum.IntFlag):
     NONE = 0
     #: The payload is a partial sum that the coordinator must add to others.
+    #: Set on a ``FAST`` reply, and only on one.
     PARTIAL = 1 << 0
     #: The sender read this expert from NVMe rather than RAM; the coordinator
     #: uses it to explain a slow layer without guessing.
     FROM_STORAGE = 1 << 1
     #: The node is shedding load and would like fewer of these.
     BACKPRESSURE = 1 << 2
+    #: Request: collapse this batch into one gate-weighted sum instead of
+    #: returning a row per expert. Opt-in, because it re-associates the layer's
+    #: fp32 reduction and can therefore change the token that gets emitted.
+    FAST = 1 << 3
+    #: Reply: the payload is :class:`ExpertRowsPayload` — one weighted row per
+    #: expert, tagged with its expert id. The default shape.
+    PER_EXPERT = 1 << 4
+    #: Reply: served from the node's dedup cache, i.e. this is a retry of a
+    #: batch that already ran and the experts were *not* run a second time.
+    REPLAYED = 1 << 5
 
 
 @dataclass
@@ -170,6 +200,7 @@ class Frame:
 
 _U32 = struct.Struct("<I")
 _U16 = struct.Struct("<H")
+_U64 = struct.Struct("<Q")
 
 
 def encode_vector(vec: np.ndarray) -> bytes:
@@ -193,22 +224,39 @@ class ExpertBatchPayload:
 
     ``expert_ids`` are global ids within the layer, so a node that has been
     handed a different shard range still interprets them the same way.
+
+    ``batch_id`` names this *logical* batch, as distinct from the header's
+    per-connection ``request_id``. A coordinator reuses it when it re-sends the
+    same batch after a timeout or a dropped socket, which is what lets the node
+    recognise the retry and replay its first answer instead of running the
+    experts twice. It is optional: a caller that does not care sends ``None``
+    and gets at-least-once execution, which for a pure function of
+    (activation, weights) is only a waste of a console's time.
     """
 
     expert_ids: Tuple[int, ...]
     gates: Tuple[float, ...]
     activation: np.ndarray
+    batch_id: Optional[int] = None
 
     def encode(self) -> bytes:
         if len(self.expert_ids) != len(self.gates):
             raise ValueError("expert_ids and gates must be the same length")
+        if self.batch_id is not None and not 0 <= self.batch_id < 1 << 64:
+            raise ValueError(f"batch_id {self.batch_id} is not a u64")
         activation = encode_vector(self.activation)
         out = [_U16.pack(len(self.expert_ids)),
                # The activation length is stated rather than inferred from
                # what is left in the buffer: a truncated tail is otherwise a
                # perfectly well-formed batch with a shorter hidden state, and
                # the node would happily compute a wrong answer from it.
-               _U32.pack(len(activation) // 4)]
+               _U32.pack(len(activation) // 4),
+               # Presence byte rather than a header flag: the payload then
+               # parses without reference to the header, so there is exactly
+               # one place that can be wrong about whether an id is present.
+               b"\x01" if self.batch_id is not None else b"\x00"]
+        if self.batch_id is not None:
+            out.append(_U64.pack(self.batch_id))
         for eid in self.expert_ids:
             out.append(_U16.pack(eid))
         out.append(np.asarray(self.gates, dtype="<f4").tobytes())
@@ -225,11 +273,23 @@ class ExpertBatchPayload:
         an unhandled exception is the difference between a logged incident and
         a dropped connection.
         """
-        if len(payload) < _U16.size + _U32.size:
+        if len(payload) < _U16.size + _U32.size + 1:
             raise ValueError("expert batch is too short to hold its counts")
         (count,) = _U16.unpack_from(payload, 0)
         (n_activation,) = _U32.unpack_from(payload, _U16.size)
         offset = _U16.size + _U32.size
+        has_id = payload[offset]
+        offset += 1
+        if has_id not in (0, 1):
+            raise ValueError(f"expert batch batch_id presence byte is "
+                             f"{has_id}, which is neither 0 nor 1")
+        batch_id: Optional[int] = None
+        if has_id:
+            if len(payload) < offset + _U64.size:
+                raise ValueError("expert batch claims a batch_id but is "
+                                 "truncated before it")
+            (batch_id,) = _U64.unpack_from(payload, offset)
+            offset += _U64.size
         needed = offset + count * (_U16.size + 4) + n_activation * 4
         if len(payload) != needed:
             raise ValueError(f"expert batch declares {count} experts and a "
@@ -246,7 +306,102 @@ class ExpertBatchPayload:
         offset += 4 * count
         activation = np.frombuffer(payload, dtype="<f4", count=n_activation,
                                    offset=offset)
-        return cls(tuple(ids), tuple(float(g) for g in gates), activation)
+        return cls(tuple(ids), tuple(float(g) for g in gates), activation,
+                   batch_id)
+
+
+@dataclass
+class ExpertRowsPayload:
+    """One weighted contribution per expert, each tagged with its expert id.
+
+    This is the default reply to an :class:`ExpertBatchPayload`, and the reason
+    the whole stack is reproducible. ``rows[i]`` is ``gate_i * expert_i(x)``
+    with no cross-expert addition performed anywhere on the node, so the
+    coordinator can add every expert of a layer in strict top-k order no matter
+    which console each one came from. Move an expert to a different console,
+    replan the fleet, lose a node to a replica — the arithmetic is unchanged,
+    because the additions never happened in a placement-dependent order in the
+    first place.
+
+    The cost is upstream bandwidth, and it is smaller than it looks: a shelf
+    wide enough to be worth building already scatters a token's top-k across
+    almost as many consoles as there are experts in it, so the sum a node would
+    have collapsed is usually one or two terms long. ``Flags.FAST`` buys those
+    back and gives up the guarantee.
+
+    Layout::
+
+        n_rows  : uint16
+        width   : uint32          elements per row, stated not inferred
+        experts : n_rows * uint16
+        rows    : n_rows * width * float32
+    """
+
+    expert_ids: Tuple[int, ...]
+    rows: np.ndarray                    # (n_rows, width) float32
+
+    def __post_init__(self) -> None:
+        rows = np.asarray(self.rows, dtype=np.float32)
+        if rows.ndim != 2:
+            raise ValueError(f"rows must be 2-D (n_rows, width), got shape "
+                             f"{rows.shape}")
+        if rows.shape[0] != len(self.expert_ids):
+            raise ValueError(f"{len(self.expert_ids)} expert ids against "
+                             f"{rows.shape[0]} rows")
+        self.rows = rows
+
+    def encode(self) -> bytes:
+        n_rows, width = self.rows.shape
+        out = [_U16.pack(n_rows), _U32.pack(width)]
+        for eid in self.expert_ids:
+            out.append(_U16.pack(eid))
+        out.append(np.ascontiguousarray(self.rows, dtype="<f4").tobytes())
+        return b"".join(out)
+
+    @classmethod
+    def decode(cls, payload: bytes) -> "ExpertRowsPayload":
+        if len(payload) < _U16.size + _U32.size:
+            raise ValueError("expert rows payload is too short to hold its "
+                             "counts")
+        (n_rows,) = _U16.unpack_from(payload, 0)
+        (width,) = _U32.unpack_from(payload, _U16.size)
+        offset = _U16.size + _U32.size
+        needed = offset + n_rows * _U16.size + n_rows * width * 4
+        if len(payload) != needed:
+            raise ValueError(f"expert rows payload declares {n_rows} rows of "
+                             f"width {width}, which needs {needed} bytes; got "
+                             f"{len(payload)}")
+        if n_rows == 0:
+            raise ValueError("expert rows payload carries no rows")
+        ids = []
+        for _ in range(n_rows):
+            (eid,) = _U16.unpack_from(payload, offset)
+            ids.append(eid)
+            offset += _U16.size
+        rows = np.frombuffer(payload, dtype="<f4", count=n_rows * width,
+                             offset=offset).reshape(n_rows, width)
+        return cls(tuple(ids), rows)
+
+
+def accumulate(rows: Sequence[np.ndarray]) -> np.ndarray:
+    """Add contributions left to right, in the order given.
+
+    The one place in the stack where a sum of expert outputs is formed. It is a
+    function rather than ``np.sum(rows, axis=0)`` because numpy sums pairwise:
+    that is more accurate, and it is *a different number*. Reproducibility here
+    means every summation — on a node collapsing a FAST batch, on the
+    coordinator reducing a layer, in a single-process reference run — folds in
+    exactly the same order, so a plan change cannot move a bit.
+
+    The caller is responsible for the order being the meaningful one (top-k
+    position, not arrival, and not unit id).
+    """
+    if not rows:
+        raise ValueError("nothing to accumulate")
+    total = np.array(rows[0], dtype=np.float32, copy=True)
+    for row in rows[1:]:
+        total += np.asarray(row, dtype=np.float32)
+    return total
 
 
 @dataclass

@@ -5,11 +5,12 @@ import unittest
 
 import numpy as np
 
-from gen9_cluster.protocol import (HEADER_SIZE, MAX_PAYLOAD, VERSION,
-                                   DType, ExpertBatchPayload, Flags, Frame,
+from gen9_cluster.protocol import (HEADER_SIZE, MAX_PAYLOAD, VERSION, _U16,
+                                   _U32, DType, ExpertBatchPayload,
+                                   ExpertRowsPayload, Flags, Frame,
                                    HelloPayload, MsgType, ShardHeader,
-                                   decode_error, decode_vector, encode_error,
-                                   encode_vector)
+                                   accumulate, decode_error, decode_vector,
+                                   encode_error, encode_vector)
 
 
 class TestFrame(unittest.TestCase):
@@ -114,6 +115,87 @@ class TestExpertBatch(unittest.TestCase):
         with self.assertRaises(ValueError):
             ExpertBatchPayload((1, 2, 3), (0.5, 0.5),
                                np.zeros(4, dtype=np.float32)).encode()
+
+    def test_the_batch_id_survives_the_round_trip(self):
+        x = np.zeros(8, dtype=np.float32)
+        with_id = ExpertBatchPayload((1,), (1.0,), x, 2 ** 63 + 5)
+        self.assertEqual(ExpertBatchPayload.decode(with_id.encode()).batch_id,
+                         2 ** 63 + 5)
+        without = ExpertBatchPayload((1,), (1.0,), x)
+        self.assertIsNone(ExpertBatchPayload.decode(without.encode()).batch_id)
+
+    def test_a_batch_id_that_is_not_a_u64_is_refused(self):
+        x = np.zeros(4, dtype=np.float32)
+        for bad in (-1, 2 ** 64):
+            with self.assertRaises(ValueError):
+                ExpertBatchPayload((1,), (1.0,), x, bad).encode()
+
+    def test_a_batch_truncated_inside_its_id_is_rejected(self):
+        raw = ExpertBatchPayload((1,), (1.0,), np.zeros(4, dtype=np.float32),
+                                 99).encode()
+        with self.assertRaises(ValueError):
+            ExpertBatchPayload.decode(raw[:11])
+
+
+class TestExpertRows(unittest.TestCase):
+    def test_round_trip(self):
+        rows = np.arange(12, dtype=np.float32).reshape(3, 4)
+        payload = ExpertRowsPayload((7, 8, 9), rows)
+        decoded = ExpertRowsPayload.decode(payload.encode())
+        self.assertEqual(decoded.expert_ids, (7, 8, 9))
+        np.testing.assert_array_equal(decoded.rows, rows)
+
+    def test_a_row_stays_with_its_expert(self):
+        """The tag is the whole point: the coordinator reorders these, so a
+        row that loses its expert id becomes a term in the wrong place."""
+        rows = np.array([[1.0, 1.0], [2.0, 2.0]], dtype=np.float32)
+        decoded = ExpertRowsPayload.decode(
+            ExpertRowsPayload((41, 5), rows).encode())
+        by_expert = dict(zip(decoded.expert_ids, decoded.rows))
+        np.testing.assert_array_equal(by_expert[41], [1.0, 1.0])
+        np.testing.assert_array_equal(by_expert[5], [2.0, 2.0])
+
+    def test_truncated_payloads_are_rejected(self):
+        raw = ExpertRowsPayload(
+            (1, 2), np.zeros((2, 8), dtype=np.float32)).encode()
+        for cut in (2, len(raw) // 2, len(raw) - 4):
+            with self.assertRaises(ValueError):
+                ExpertRowsPayload.decode(raw[:cut])
+
+    def test_trailing_bytes_are_rejected(self):
+        raw = ExpertRowsPayload(
+            (1,), np.zeros((1, 4), dtype=np.float32)).encode()
+        with self.assertRaises(ValueError):
+            ExpertRowsPayload.decode(raw + b"\x00\x00\x00\x00")
+
+    def test_ids_and_rows_must_agree(self):
+        with self.assertRaises(ValueError):
+            ExpertRowsPayload((1, 2), np.zeros((3, 4), dtype=np.float32))
+
+    def test_an_empty_reply_is_rejected(self):
+        """A batch always names at least one expert, so no rows means the
+        reply is malformed rather than legitimately empty."""
+        with self.assertRaises(ValueError):
+            ExpertRowsPayload.decode(_U16.pack(0) + _U32.pack(4))
+
+
+class TestAccumulate(unittest.TestCase):
+    def test_it_folds_left_to_right(self):
+        """Not np.sum: numpy sums pairwise, which is a different number."""
+        rows = [np.float32([1.0]), np.float32([1e8]), np.float32([-1e8])]
+        # 1 + 1e8 rounds the 1 away, and it never comes back.
+        np.testing.assert_array_equal(accumulate(rows), np.float32([0.0]))
+        np.testing.assert_array_equal(
+            accumulate(list(reversed(rows))), np.float32([1.0]))
+
+    def test_it_does_not_alias_its_first_row(self):
+        first = np.ones(4, dtype=np.float32)
+        accumulate([first, np.ones(4, dtype=np.float32)])
+        np.testing.assert_array_equal(first, np.ones(4, dtype=np.float32))
+
+    def test_nothing_to_add_is_an_error_not_a_zero(self):
+        with self.assertRaises(ValueError):
+            accumulate([])
 
 
 class TestShardHeader(unittest.TestCase):

@@ -1,4 +1,4 @@
-# G9XC — the wire protocol, version 1
+# G9XC — the wire protocol, version 2
 
 G9XC carries activations, expert requests and shard loads between a shelf
 coordinator and its consoles. It is a descendant of the PS3 port's P3XC, with
@@ -11,9 +11,14 @@ the changes ninth-generation hardware forces. Normative implementation:
 expert, so P3XC could put the expert id in the header. A PS5 holds dozens, and
 a token whose top-8 routes into three experts on one console must not cost three
 round trips. `EXPERT_BATCH` therefore names a *set* of experts with their gate
-weights, and the node replies with their gate-weighted sum as one
-`EXPERT_RESULT`. At 74 blocks and a quarter-millisecond hop this is the
-difference between ~5 ms and ~20 ms of pure latency per token.
+weights and gets one `EXPERT_RESULT` back. At 74 blocks and a
+quarter-millisecond hop this is the difference between ~5 ms and ~20 ms of pure
+latency per token.
+
+**The reply is one row per expert, not a sum.** This is P3XC's rule *kept*. A
+node returns `gate_i * expert_i(x)` for each expert it was asked for, tagged
+with the expert id, and the coordinator adds them in the router's top-k order.
+See [Reproducibility](#reproducibility) for why, and `FAST` for the way out.
 
 **Weights are FP8 with block scales.** The dtype field names
 `fp8-e4m3-b128` and a `LOAD_SHARD` carrying it also carries its scales, so a
@@ -32,7 +37,7 @@ delimiter scanning, no partial-parse states.
 ```
 offset size field
   0     4   magic        "G9XC"
-  4     1   version      1
+  4     1   version      2
   5     1   type         MsgType
   6     2   flags        Flags bitfield
   8     4   request_id   echoed by the reply
@@ -49,7 +54,7 @@ offset size field
 `struct` format: `<4sBBHIHHIBBHI4x`.
 
 A header is rejected unless it is exactly 32 bytes, starts with `G9XC`, has
-version 1, names a known `MsgType`, and declares `payload_len <= 64 MiB`. The
+version 2, names a known `MsgType`, and declares `payload_len <= 64 MiB`. The
 size cap exists so a corrupt length field cannot ask for all of memory; a
 legitimate frame is an activation (tens of KiB) or a shard chunk.
 
@@ -69,7 +74,7 @@ Request ids are per-connection, wrap at 2³², and skip 0.
 | 1 | `HELLO` | node → coord | `HelloPayload` |
 | 2 | `HELLO_ACK` | coord → node | empty |
 | 3 | `EXPERT_BATCH` | coord → node | `ExpertBatchPayload` |
-| 4 | `EXPERT_RESULT` | node → coord | vector (gate-weighted sum) |
+| 4 | `EXPERT_RESULT` | node → coord | `ExpertRowsPayload`, or a vector under `FAST` |
 | 5 | `BLOCK_FWD` | coord → node | vector (hidden state) |
 | 6 | `BLOCK_RESULT` | node → coord | vector |
 | 7 | `LOAD_SHARD` | coord → node | `ShardHeader` + body |
@@ -81,20 +86,31 @@ Request ids are per-connection, wrap at 2³², and skip 0.
 
 ### Flags
 
-| bit | name | meaning |
-|---|---|---|
-| 0 | `PARTIAL` | a partial sum the coordinator must add to others |
-| 1 | `FROM_STORAGE` | served from NVMe, not RAM — why this layer was slow |
-| 2 | `SHEDDING` | the node wants less of this |
+| bit | name | direction | meaning |
+|---|---|---|---|
+| 0 | `PARTIAL` | reply | a collapsed partial sum; set on a `FAST` reply and only there |
+| 1 | `FROM_STORAGE` | reply | served from NVMe, not RAM — why this layer was slow |
+| 2 | `BACKPRESSURE` | reply | the node wants less of this |
+| 3 | `FAST` | request | collapse this batch into one sum; opt-in, see below |
+| 4 | `PER_EXPERT` | reply | the payload is `ExpertRowsPayload`. The default |
+| 5 | `REPLAYED` | reply | served from the dedup cache; the experts did not run again |
 
 `FROM_STORAGE` is the one worth setting carefully. It is how a coordinator
 explains a slow layer instead of guessing at it.
+
+A coordinator **must reject** an `EXPERT_RESULT` carrying `PARTIAL` for a batch
+that did not set `FAST`. Such a reply is a node that re-associated the sum
+without being asked, and its number cannot be placed in top-k order; accepting
+it would produce a plausible wrong answer, which is the exact failure this
+design exists to prevent.
 
 ### `ExpertBatchPayload`
 
 ```
 u16  n_experts
 u32  n_activation        (elements, not bytes)
+u8   has_batch_id        0 or 1; any other value is malformed
+u64  batch_id            present only if has_batch_id == 1
 u16  expert_id           x n_experts
 f32  gate                x n_experts
 f32  activation          x n_activation
@@ -105,6 +121,30 @@ truncated tail would otherwise be a perfectly well-formed batch with a shorter
 hidden state, and the node would compute a confidently wrong answer from it.
 A decoder must require the payload to be exactly the implied size, and must
 reject a batch naming zero experts.
+
+`batch_id` names the *logical* batch, as distinct from the header's
+`request_id`, which is per-connection and is reallocated on reconnect. A
+coordinator reuses one `batch_id` across every attempt at the same batch; see
+[Errors and retries](#errors-and-retries).
+
+### `ExpertRowsPayload`
+
+The default `EXPERT_RESULT`, flagged `PER_EXPERT`.
+
+```
+u16  n_rows
+u32  width               elements per row
+u16  expert_id           x n_rows
+f32  row                 x n_rows * width   (row-major)
+```
+
+`row[i]` is `gate_i * expert_i(activation)`, with no cross-expert addition
+performed on the node. Rows may be returned in any order; the tag is what
+matters. A decoder must require the exact implied length and reject zero rows.
+
+A coordinator must check that the set of returned ids equals the set it asked
+for. A missing row is a missing term in the layer's sum, and silently dropping
+one costs an expert's contribution without any error being raised.
 
 ### `ShardHeader`
 
@@ -162,16 +202,100 @@ names one console.
 Retry safety is per operation, not per error:
 
 - `EXPERT_BATCH` is **stateless** — the same experts on the same activation
-  give the same sum — so it may be retried, and may be re-sent to a replica
+  give the same rows — so it may be retried, and may be re-sent to a replica
   console that holds *all* of the failed batch's experts.
 - `BLOCK_FWD` is **stateful**: it appends to the host's MLA KV cache. It is
   never retried automatically, and a shelf host is never failed over, because
   the KV cache for those layers exists only there.
 
+### Exactly-once, and where it stops
+
+A coordinator that times out cannot tell whether the console ran the experts
+before the socket died or after, so a plain retry is *at-least-once*. Every
+attempt at one batch therefore carries the same `batch_id`, and a node keeps a
+bounded cache of what it answered
+([`gen9_cluster/dedup.py`](../gen9_cluster/dedup.py)):
+
+- Same `batch_id`, same content: the first attempt's bytes are replayed,
+  flagged `REPLAYED`, and the weights are not touched again.
+- Same `batch_id`, still running: the retry **waits** for the first attempt
+  rather than starting a second pass. This is the common case on a console that
+  is merely slow, and it is where the saving actually is.
+- Same `batch_id`, different content: rejected with `ERROR`. Replaying the
+  wrong activation's output would be a wrong token that no log explains.
+- No `batch_id`: no deduplication. Legal, and only costs a console's time.
+
+The cache is bounded three ways — entries, total cached bytes, and a TTL — and
+never evicts a batch that is still running; when every tracked batch is in
+flight a new one is refused with `BACKPRESSURE` rather than something in flight
+being dropped. A failed batch is not cached as an answer, and a reply too large
+for the byte budget is returned but not retained.
+
+**This is per node process.** A retry sent to a *different* console (the
+replica path) cannot be deduplicated without shared state, which G9XC does not
+have and does not want. That case is safe for a different reason: the
+coordinator uses one reply and discards the other, so the duplicated execution
+cannot reach the sum. A node restart also clears the cache, and a retry across
+it re-executes.
+
+## Reproducibility
+
+Floating-point addition is not associative, so *the order a layer's experts are
+summed in is part of the answer*. G9XC fixes that order at the only place that
+knows it: the router's top-k ranking.
+
+- A node never adds two experts together unless asked. It returns rows.
+- The coordinator folds those rows left to right in top-k order, whatever order
+  the replies arrived in and whatever console each came from.
+- Every summation in the stack — coordinator reduction, a node collapsing a
+  `FAST` batch, a single-process reference run — goes through one `accumulate`
+  helper that folds left to right. Notably *not* `np.sum`, which sums pairwise:
+  that is more accurate, and it is a different number.
+
+What this buys: the same prompt gives the same bits regardless of how the
+planner spread the experts over the shelf. On a fleet of second-hand consoles
+that is not a theoretical property — a unit dies, the planner reshuffles, and
+without this the model would quietly start emitting different tokens, with no
+error anywhere and nothing in the logs pointing at the console that failed.
+
+### What it does not buy
+
+Reduction order is fixed; **kernel arithmetic is not**. A shelf may mix
+`cpu-avx2`, `vulkan` and `rocm` nodes, and those three do not accumulate an
+expert's FMAs in the same order internally. Two consoles running the same
+expert on different backends may therefore return rows differing in the last
+bits, and the layer sum differs with them.
+
+So, precisely: **for a fixed assignment of experts to backends, the output is
+reproducible and placement-independent.** Bit-identity across a heterogeneous
+fleet would additionally require pinning one reference kernel, which this stack
+deliberately does not do — its whole point is to use whatever silicon is in the
+rack. A deployment that needs fleet-wide bit-identity must run one backend.
+
+### `FAST`
+
+Setting `FAST` on an `EXPERT_BATCH` asks the node to collapse its experts into
+one gate-weighted sum, replied with `PARTIAL`. The coordinator then has no
+per-expert structure to reduce and falls back to summing by unit id: still
+deterministic run to run, no longer invariant under a replan.
+
+The trade is reply bandwidth. Exact mode sends `k` rows per layer where `FAST`
+sends one per console touched. At the V4-Pro profile (hidden 8192, k=8, 69 MoE
+layers) that is ~18.1 MB/token exact against ~15.4 MB/token collapsed, because
+a shelf wide enough to be worth building already scatters the top-8 across
+~6.8 consoles — the sum being collapsed is usually one or two terms long. ~17%
+of reply bandwidth is a poor price for an answer that depends on the current
+plan, which is why exact is the default and `FAST` is a flag.
+
 ## Versioning
 
-`version` is a hard match in v1: a frame with a different version is rejected
-at the header. Adding a message type is backwards compatible (unknown types are
+`version` is a hard match: a frame with a different version is rejected at the
+header. Adding a message type is backwards compatible (unknown types are
 rejected as malformed, which is the intended outcome for a peer that should not
 be sending them); changing a payload layout is not, and requires the version
 byte to move.
+
+**v1 → v2.** `EXPERT_RESULT` became `ExpertRowsPayload` by default, and
+`ExpertBatchPayload` gained `has_batch_id`/`batch_id`. A v1 node and a v2
+coordinator disagree about the shape of every expert reply, so the version
+check catches it at the first frame rather than as wrong logits an hour later.

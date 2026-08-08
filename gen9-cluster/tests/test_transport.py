@@ -16,8 +16,9 @@ import numpy as np
 from gen9_cluster import fp8
 from gen9_cluster.errors import ConnectError, Gen9Error
 from gen9_cluster.node import ExpertWeights, NodeServer, ShardStore
-from gen9_cluster.protocol import (DType, ExpertBatchPayload, Frame, MsgType,
-                                   ShardHeader, decode_vector,
+from gen9_cluster.protocol import (DType, ExpertBatchPayload,
+                                   ExpertRowsPayload, Flags, Frame, MsgType,
+                                   ShardHeader, accumulate, decode_vector,
                                    encode_vector)
 from gen9_cluster.transport import ConnectionPool, NodeConnection
 
@@ -83,22 +84,65 @@ class TestBasicExchange(NodeFixture):
 
 
 class TestExpertExecution(NodeFixture):
-    def test_a_batch_returns_the_gate_weighted_sum(self):
-        conn = self.connect()
-        x = np.arange(HIDDEN, dtype=np.float32) * 0.1
-        ids, gates = (0, 1, 2), (0.5, 0.25, 0.25)
-        payload = ExpertBatchPayload(ids, gates, x).encode()
-        reply = conn.request(Frame(MsgType.EXPERT_BATCH, 0, payload, layer=0))
-        got = decode_vector(reply.payload)
-
-        expected = np.zeros(HIDDEN, dtype=np.float32)
+    def _reference_rows(self, x, ids, gates):
+        rows = []
         for expert, gate in zip(ids, gates):
             weights = self.store.get(0, expert)
             hidden = x @ weights.gate.T
             hidden = hidden * (1.0 / (1.0 + np.exp(-hidden)))
             hidden = hidden * (x @ weights.up.T)
-            expected += gate * (hidden @ weights.down.T)
-        np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-6)
+            rows.append(np.float32(gate) * (hidden @ weights.down.T))
+        return rows
+
+    def test_a_batch_returns_one_tagged_row_per_expert(self):
+        """The default reply is per-expert, so the caller owns the order."""
+        conn = self.connect()
+        x = np.arange(HIDDEN, dtype=np.float32) * 0.1
+        ids, gates = (0, 1, 2), (0.5, 0.25, 0.25)
+        payload = ExpertBatchPayload(ids, gates, x).encode()
+        reply = conn.request(Frame(MsgType.EXPERT_BATCH, 0, payload, layer=0))
+
+        self.assertTrue(reply.flags & Flags.PER_EXPERT)
+        self.assertFalse(reply.flags & Flags.PARTIAL)
+        rows = ExpertRowsPayload.decode(reply.payload)
+        self.assertEqual(rows.expert_ids, ids)
+        for index, want in enumerate(self._reference_rows(x, ids, gates)):
+            np.testing.assert_allclose(rows.rows[index], want, rtol=1e-5,
+                                       atol=1e-6)
+
+    def test_fast_collapses_the_batch_only_when_asked(self):
+        conn = self.connect()
+        x = np.arange(HIDDEN, dtype=np.float32) * 0.1
+        ids, gates = (0, 1, 2), (0.5, 0.25, 0.25)
+        payload = ExpertBatchPayload(ids, gates, x).encode()
+        reply = conn.request(Frame(MsgType.EXPERT_BATCH, 0, payload, layer=0,
+                                   flags=Flags.FAST))
+
+        self.assertTrue(reply.flags & Flags.PARTIAL)
+        self.assertFalse(reply.flags & Flags.PER_EXPERT)
+        got = decode_vector(reply.payload)
+        self.assertEqual(got.shape, (HIDDEN,))
+        # Same folding order as the node uses, so this is exact, not close.
+        np.testing.assert_array_equal(
+            got, accumulate(self._reference_rows(x, ids, gates)))
+
+    def test_a_retry_of_the_same_batch_id_is_replayed_not_recomputed(self):
+        conn = self.connect()
+        x = np.arange(HIDDEN, dtype=np.float32) * 0.1
+        payload = ExpertBatchPayload((0, 1), (0.5, 0.5), x, 4242).encode()
+        frame = Frame(MsgType.EXPERT_BATCH, 0, payload, layer=0)
+
+        first = conn.request(frame)
+        ran = self.node.experts_run
+        second = conn.request(frame)
+
+        self.assertEqual(self.node.experts_run, ran,
+                         "the retry re-ran the experts")
+        self.assertTrue(second.flags & Flags.REPLAYED)
+        self.assertFalse(first.flags & Flags.REPLAYED)
+        np.testing.assert_array_equal(
+            ExpertRowsPayload.decode(second.payload).rows,
+            ExpertRowsPayload.decode(first.payload).rows)
 
     def test_a_missing_shard_is_an_error_reply_not_a_dropped_connection(self):
         """The console keeps serving: one bad request must not cost the

@@ -18,7 +18,14 @@ pinning hot experts to the GPU, arrived at by letting the kernel do it.
 :class:`ExpertRunner` is the compute seam. The reference implementation is
 numpy, which is honest and slow; a console plugs in the AVX2, Vulkan or HIP
 kernel from ``kernels/`` by passing a different runner. Nothing else in the
-stack knows which backend is in use.
+stack knows which backend is in use. A runner implements
+:meth:`ExpertRunner.rows` — one weighted output per expert, no cross-expert
+addition — and the base class derives the collapsed sum from it, so no backend
+gets to choose its own reduction order.
+
+The node does not sum a batch unless it is asked to. Its reply is one row per
+expert, tagged, and the coordinator adds them in top-k order; see
+:mod:`gen9_cluster.protocol`. ``Flags.FAST`` opts into the collapsed sum.
 """
 
 from __future__ import annotations
@@ -33,10 +40,13 @@ from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 import numpy as np
 
 from . import fp8
+from .dedup import (DedupCache, DedupCapacityError, MismatchedBatchError,
+                    batch_fingerprint)
 from .errors import CapacityError, ShardMissing
-from .protocol import (HEADER_SIZE, DType, ExpertBatchPayload, Flags, Frame,
-                       HelloPayload, MsgType, ShardHeader, decode_vector,
-                       encode_error, encode_vector)
+from .protocol import (HEADER_SIZE, DType, ExpertBatchPayload,
+                       ExpertRowsPayload, Flags, Frame, HelloPayload, MsgType,
+                       ShardHeader, accumulate, decode_vector, encode_error,
+                       encode_vector)
 
 #: (layer, expert) -> the three matrices of a DeepSeek expert.
 ExpertKey = Tuple[int, int]
@@ -97,28 +107,43 @@ class ExpertWeights:
 
 
 class ExpertRunner:
-    """Runs a batch of experts on one activation. Replaceable per backend."""
+    """Runs a batch of experts on one activation. Replaceable per backend.
+
+    Backends override :meth:`rows`, never :meth:`__call__`. Returning the
+    experts separately and letting the caller decide whether and in what order
+    to add them is what keeps the answer independent of where the experts
+    happen to live: a backend that summed internally would bake this node's
+    particular shard assignment into the arithmetic.
+    """
 
     name = "numpy-reference"
 
-    def __call__(self, activation: np.ndarray,
-                 experts: Sequence[ExpertWeights],
-                 gates: Sequence[float]) -> np.ndarray:
-        """Gate-weighted sum of SwiGLU experts.
-
-        Summing on the node rather than returning each expert's output is the
-        difference between one reply and ``k`` replies; at eight experts and a
-        32 KiB hidden state that is 256 KiB saved per layer per token.
-        """
-        out = np.zeros_like(activation, dtype=np.float32)
-        for weights, gate in zip(experts, gates):
+    def rows(self, activation: np.ndarray,
+             experts: Sequence[ExpertWeights],
+             gates: Sequence[float]) -> np.ndarray:
+        """``gate_i * expert_i(activation)`` for each expert, as a 2-D array."""
+        out = np.empty((len(experts), activation.size), dtype=np.float32)
+        for index, (weights, gate) in enumerate(zip(experts, gates)):
             if weights.quantised:
                 weights = weights.dequantised()
             hidden = activation @ weights.gate.T
             hidden = hidden * (1.0 / (1.0 + np.exp(-hidden)))   # SiLU
             hidden = hidden * (activation @ weights.up.T)
-            out += float(gate) * (hidden @ weights.down.T)
+            out[index] = np.float32(gate) * (hidden @ weights.down.T)
         return out
+
+    def __call__(self, activation: np.ndarray,
+                 experts: Sequence[ExpertWeights],
+                 gates: Sequence[float]) -> np.ndarray:
+        """Gate-weighted sum of SwiGLU experts, folded left to right.
+
+        Only used for a ``FAST`` batch, and defined here rather than in each
+        backend so that every collapsed sum in the fleet folds in the same
+        order whatever kernel produced the rows.
+        """
+        if not experts:
+            return np.zeros_like(activation, dtype=np.float32)
+        return accumulate(list(self.rows(activation, experts, gates)))
 
 
 class ShardStore:
@@ -199,7 +224,8 @@ class NodeServer:
                  block_fn: Optional[Callable[[int, np.ndarray], np.ndarray]] = None,
                  sku: str = "unknown", backend: str = "cpu-avx2",
                  runtime: str = "host-sim", weight_bytes: int = 0,
-                 fast_bytes: int = 0, gemv_gflops: float = 0.0):
+                 fast_bytes: int = 0, gemv_gflops: float = 0.0,
+                 dedup: Optional[DedupCache] = None):
         self.store = store
         self.unit_id = unit_id
         self.host = host
@@ -210,6 +236,7 @@ class NodeServer:
                                   runtime=runtime, weight_bytes=weight_bytes,
                                   fast_bytes=fast_bytes,
                                   gemv_gflops=gemv_gflops)
+        self.dedup = dedup if dedup is not None else DedupCache()
         self.tokens_served = 0
         self.experts_run = 0
         self.storage_reads = 0
@@ -311,19 +338,57 @@ class NodeServer:
                      self.hello.encode())
 
     def _on_expert_batch(self, frame: Frame) -> Frame:
+        """Run a batch once, and answer with rows unless FAST was asked for.
+
+        The dedup cache wraps the *whole* reply including its flags, so a
+        replay is byte-identical to what the first attempt sent — apart from
+        ``REPLAYED``, which is set on the way out so the coordinator's stats
+        can tell a cheap retry from an expensive one.
+        """
         payload = ExpertBatchPayload.decode(frame.payload)
+        fast = bool(frame.flags & Flags.FAST)
+        fingerprint = batch_fingerprint(frame.layer, payload.expert_ids,
+                                        payload.gates, payload.activation,
+                                        fast)
+
+        def compute() -> bytes:
+            return self._run_batch(frame, payload, fast).encode()
+
+        try:
+            raw, replayed = self.dedup.run(payload.batch_id, fingerprint,
+                                           compute)
+        except MismatchedBatchError as exc:
+            return self._error(frame, str(exc))
+        except DedupCapacityError as exc:
+            reply = self._error(frame, str(exc))
+            reply.flags |= Flags.BACKPRESSURE
+            return reply
+        reply, _ = Frame.decode_header(raw[:HEADER_SIZE])
+        reply.payload = raw[HEADER_SIZE:]
+        reply.request_id = frame.request_id
+        if replayed:
+            reply.flags |= Flags.REPLAYED
+        return reply
+
+    def _run_batch(self, frame: Frame, payload: ExpertBatchPayload,
+                   fast: bool) -> Frame:
         weights = [self.store.get(frame.layer, eid)
                    for eid in payload.expert_ids]
-        out = self.runner(payload.activation, weights, payload.gates)
+        rows = self.runner.rows(payload.activation, weights, payload.gates)
         self.experts_run += len(weights)
         self.tokens_served += 1
-        flags = Flags.PARTIAL
+        flags = Flags.NONE
         if any(w.tier == "ssd" for w in weights):
             self.storage_reads += 1
             flags |= Flags.FROM_STORAGE
-        return Frame(MsgType.EXPERT_RESULT, frame.request_id,
-                     encode_vector(out), layer=frame.layer, token=frame.token,
-                     flags=flags)
+        if fast:
+            flags |= Flags.PARTIAL
+            body = encode_vector(accumulate(list(rows)))
+        else:
+            flags |= Flags.PER_EXPERT
+            body = ExpertRowsPayload(payload.expert_ids, rows).encode()
+        return Frame(MsgType.EXPERT_RESULT, frame.request_id, body,
+                     layer=frame.layer, token=frame.token, flags=flags)
 
     def _on_block(self, frame: Frame) -> Frame:
         if self.block_fn is None:

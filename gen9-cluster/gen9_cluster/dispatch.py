@@ -5,25 +5,38 @@ token on the V4-Pro profile. Three decisions define it.
 
 **Group by console before sending.** A token's eight experts may live on three
 consoles. Naively that is eight requests; grouped, it is three, and each console
-returns the gate-weighted sum of the experts it holds. Round trips, not FLOPs,
-are what a console fleet is short of.
+answers for every expert it holds in one reply. Round trips, not FLOPs, are what
+a console fleet is short of.
 
-**Send concurrently, reduce deterministically.** The requests go out together
-and land in whatever order the network decides, but the partial sums are added
-back in a fixed order (by unit id). Floating-point addition is not associative,
-so reducing in arrival order would make the same prompt produce different
-tokens on different runs — a bug that is invisible until it is infuriating.
+**Send concurrently, reduce in top-k order.** The requests go out together and
+land in whatever order the network decides, but the reduction does not depend on
+the network *or on the placement*. Each console returns one row per expert,
+tagged with the expert it came from, and this module adds them strictly in the
+order the router ranked them — the same order, and therefore bit-for-bit the
+same sum, that a single machine holding all the experts would produce.
+
+Reducing by unit id instead would be reproducible run to run but not across
+plans: floating-point addition is not associative, so moving one expert to
+another console would silently change the logits and eventually the token. On a
+fleet of second-hand consoles, where a dead unit means a replan, that is a
+model whose output quietly depends on which console last failed.
+``fast=True`` accepts exactly that in exchange for the bandwidth.
 
 **Retry only what is safe to retry.** An expert evaluation mutates nothing, so a
 timeout or a dropped connection can be re-dispatched to a replica; the error
 types in :mod:`gen9_cluster.errors` carry that decision so this module never has
 to infer it from an errno. If no replica holds the expert, the dispatcher fails
 the token rather than silently dropping an expert from the sum — a quietly wrong
-answer is worse than a loud failure.
+answer is worse than a loud failure. Every attempt at a given batch reuses one
+``batch_id``, so a retry that reaches the *same* console (the common case: a
+timeout on a console that is merely slow) is answered from its dedup cache
+instead of running the experts twice.
 """
 
 from __future__ import annotations
 
+import itertools
+import secrets
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -32,13 +45,28 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .errors import Gen9Error, ShardMissing
-from .protocol import (ExpertBatchPayload, Flags, Frame, MsgType,
-                       decode_vector)
+from .errors import Gen9Error, ProtocolError, ShardMissing
+from .protocol import (ExpertBatchPayload, ExpertRowsPayload, Flags, Frame,
+                       MsgType, accumulate, decode_vector)
 from .transport import ConnectionPool, NodeConnection
 
 #: (layer, expert) -> the unit ids that hold it, best first.
 Placement = Dict[Tuple[int, int], List[str]]
+
+#: Key a FAST reply is filed under: it is one console's whole batch collapsed,
+#: so it belongs to no single expert. Negative, so it can never collide with a
+#: real expert id.
+_WHOLE_BATCH = -1
+
+#: Batch ids are drawn from a per-process random base and then counted up.
+#: Random so two coordinators (a restart, a standby taking over) cannot collide
+#: on a node's dedup cache and be served each other's answers; counted so the
+#: ids inside one process are cheap and unique.
+_BATCH_SEQUENCE = itertools.count(secrets.randbits(48) << 16)
+
+
+def _new_batch_id() -> int:
+    return next(_BATCH_SEQUENCE) % (1 << 64)
 
 
 @dataclass
@@ -56,6 +84,10 @@ class DispatchStats:
     experts_run: int = 0
     retries: int = 0
     storage_hits: int = 0
+    #: Replies a console served from its dedup cache instead of recomputing.
+    #: Non-zero means retries are landing back on the original console, which
+    #: is cheap; it is the *retries* count that costs a round trip.
+    replays: int = 0
     failed_units: List[str] = field(default_factory=list)
 
 
@@ -126,38 +158,69 @@ class ExpertDispatcher:
     # -- the hot path -----------------------------------------------------
     def run_layer(self, layer: int, activation: np.ndarray,
                   expert_ids: Sequence[int], gates: Sequence[float], *,
-                  token: int = 0) -> Tuple[np.ndarray, DispatchStats]:
-        """Run one MoE layer's routed experts and return their summed output."""
+                  token: int = 0,
+                  fast: bool = False) -> Tuple[np.ndarray, DispatchStats]:
+        """Run one MoE layer's routed experts and return their summed output.
+
+        ``expert_ids`` is the router's top-k *in rank order*, and that order is
+        the reduction order. With ``fast=False`` (the default) the result is
+        the same bits regardless of how the experts are spread over the shelf.
+        With ``fast=True`` each console collapses its own experts first, which
+        is fewer bytes on the wire and an answer that depends on the plan.
+        """
         stats = DispatchStats()
         batches = self.group_by_unit(layer, expert_ids, gates)
         stats.consoles_contacted = len(batches)
         stats.experts_run = len(expert_ids)
+        batch_id = _new_batch_id()
 
         futures = {
             unit: self._executor.submit(self._call_unit, unit, layer,
-                                        activation, ids, weights, token, stats)
+                                        activation, ids, weights, token, stats,
+                                        batch_id, fast)
             for unit, (ids, weights) in batches.items()
         }
-        partials: Dict[str, np.ndarray] = {}
+        replies: Dict[str, Dict[int, np.ndarray]] = {}
         errors: List[BaseException] = []
         for unit, future in futures.items():
             try:
-                partials[unit] = future.result()
+                replies[unit] = future.result()
             except BaseException as exc:                    # noqa: BLE001
                 errors.append(exc)
                 stats.failed_units.append(unit)
         if errors:
             raise errors[0]
 
-        # Deterministic reduction: sorted by unit id, never by arrival.
-        out = np.zeros_like(activation, dtype=np.float32)
-        for unit in sorted(partials):
-            out += partials[unit]
-        return out, stats
+        if fast:
+            # One partial per console, so top-k order is not recoverable and
+            # unit id is the only stable order left. Reproducible per plan,
+            # not across plans — which is what asking for FAST means.
+            return accumulate([replies[unit][_WHOLE_BATCH]
+                               for unit in sorted(replies)]), stats
+
+        by_expert: Dict[int, np.ndarray] = {}
+        for rows in replies.values():
+            by_expert.update(rows)
+        ordered = []
+        for expert in expert_ids:
+            row = by_expert.get(int(expert))
+            if row is None:
+                raise ProtocolError(
+                    f"no console returned a row for expert {int(expert)}; "
+                    f"the layer's sum would be missing a term", layer=layer,
+                    expert=int(expert))
+            ordered.append(row)
+        return accumulate(ordered), stats
 
     def _call_unit(self, unit: str, layer: int, activation: np.ndarray,
                    expert_ids: Sequence[int], gates: Sequence[float],
-                   token: int, stats: DispatchStats) -> np.ndarray:
+                   token: int, stats: DispatchStats, batch_id: int,
+                   fast: bool) -> Dict[int, np.ndarray]:
+        """One console's contribution, keyed by expert id.
+
+        A ``FAST`` reply has no per-expert structure, so it is returned under
+        :data:`_WHOLE_BATCH` and the caller reduces by unit id instead.
+        """
         attempted: List[str] = []
         target: Optional[str] = unit
         last: Optional[BaseException] = None
@@ -168,16 +231,19 @@ class ExpertDispatcher:
                 conn = self._connect(target)
                 payload = ExpertBatchPayload(tuple(int(e) for e in expert_ids),
                                              tuple(float(g) for g in gates),
-                                             activation).encode()
+                                             activation, batch_id).encode()
                 reply = conn.request(
                     Frame(MsgType.EXPERT_BATCH, 0, payload, layer=layer,
-                          token=token),
+                          token=token,
+                          flags=Flags.FAST if fast else Flags.NONE),
                     timeout=self.request_timeout)
                 if reply.flags & Flags.FROM_STORAGE:
                     stats.storage_hits += 1
+                if reply.flags & Flags.REPLAYED:
+                    stats.replays += 1
                 self._mark_up(target)
-                return decode_vector(reply.payload).astype(np.float32,
-                                                           copy=False)
+                return self._decode_reply(reply, target, layer, expert_ids,
+                                          fast)
             except Gen9Error as exc:
                 last = exc
                 self._mark_down(target)
@@ -193,6 +259,39 @@ class ExpertDispatcher:
                     raise
         assert last is not None
         raise last
+
+    def _decode_reply(self, reply: Frame, unit: str, layer: int,
+                      expert_ids: Sequence[int],
+                      fast: bool) -> Dict[int, np.ndarray]:
+        """Turn a console's reply into rows, checking it answered what we asked.
+
+        A node that returns a partial sum to a batch that did not set ``FAST``
+        is a version or configuration mismatch, and accepting it would produce
+        a plausible-looking number with the wrong arithmetic behind it. That is
+        precisely the failure this design exists to prevent, so it is refused.
+        """
+        per_expert = bool(reply.flags & Flags.PER_EXPERT)
+        if fast:
+            if per_expert:
+                raise ProtocolError(
+                    "console answered a FAST batch with per-expert rows",
+                    unit_id=unit, layer=layer)
+            return {_WHOLE_BATCH: decode_vector(reply.payload).astype(
+                np.float32, copy=False)}
+        if not per_expert:
+            raise ProtocolError(
+                "console collapsed a batch that did not ask for FAST; its "
+                "reduction order is unknown and its answer cannot be placed "
+                "in top-k order", unit_id=unit, layer=layer)
+        rows = ExpertRowsPayload.decode(reply.payload)
+        expected = {int(e) for e in expert_ids}
+        got = set(rows.expert_ids)
+        if got != expected:
+            raise ProtocolError(
+                f"console answered for experts {sorted(got)}, was asked for "
+                f"{sorted(expected)}", unit_id=unit, layer=layer)
+        return {int(eid): rows.rows[index]
+                for index, eid in enumerate(rows.expert_ids)}
 
     def _replica_for(self, layer: int, expert_ids: Sequence[int],
                      attempted: Sequence[str]) -> Optional[str]:

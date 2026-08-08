@@ -20,6 +20,8 @@ from gen9_cluster.hardware import ConsoleUnit, Runtime
 from gen9_cluster.model import DEEPSEEK_TINY
 from gen9_cluster.node import ExpertWeights, NodeServer, ShardStore
 from gen9_cluster.planner import plan_split
+from gen9_cluster.protocol import (ExpertRowsPayload, Flags, Frame, MsgType,
+                                   accumulate, encode_vector)
 
 HIDDEN = 16
 INTERMEDIATE = 8
@@ -126,6 +128,82 @@ class TestReduction(ClusterFixture):
         for _ in range(6):
             again, _ = disp.run_layer(0, x, ids, gates)
             np.testing.assert_array_equal(first, again)
+
+    def test_the_result_does_not_depend_on_where_the_experts_live(self):
+        """The property the whole per-expert reply shape exists to provide.
+
+        This is the failure mode that matters on a fleet of second-hand
+        consoles: a unit dies, the planner reshuffles the experts, and the
+        model starts emitting different tokens for the same prompt with no
+        error anywhere. Reducing per console would do exactly that, because
+        fp32 addition is not associative. Here the same six experts are served
+        by three consoles and then by one, and the bits must match.
+        """
+        x = np.linspace(-2, 2, HIDDEN, dtype=np.float32)
+        ids = [3, 0, 5, 1, 4, 2]
+        gates = [0.3, 0.25, 0.2, 0.1, 0.1, 0.05]
+        spread, _ = self.dispatcher().run_layer(0, x, ids, gates)
+
+        store = ShardStore()
+        for expert, weights in self.experts.items():
+            store.put(0, expert, weights)
+        node = NodeServer(store, unit_id="all", host="127.0.0.1", port=0)
+        port = node.start()
+        self.addCleanup(node.stop)
+        one = ExpertDispatcher(
+            {(0, e): ["all"] for e in self.experts},
+            {"all": NodeAddress("all", "127.0.0.1", port)})
+        self.addCleanup(one.close)
+
+        together, stats = one.run_layer(0, x, ids, gates)
+        self.assertEqual(stats.consoles_contacted, 1)
+        np.testing.assert_array_equal(spread, together)
+
+    def test_the_reduction_follows_top_k_order_not_expert_id(self):
+        """Rank order is the router's order, and it is what gets summed."""
+        disp = self.dispatcher()
+        x = np.linspace(-1, 1, HIDDEN, dtype=np.float32)
+        ids, gates = [5, 1, 3, 0], [0.4, 0.3, 0.2, 0.1]
+        got, _ = disp.run_layer(0, x, ids, gates)
+
+        rows = [reference_expert(self.experts[e], x, np.float32(g))
+                for e, g in zip(ids, gates)]
+        want = rows[0].astype(np.float32).copy()
+        for row in rows[1:]:
+            want += row
+        np.testing.assert_array_equal(got, want)
+
+    def test_fast_mode_is_opt_in_and_re_associates_the_sum(self):
+        """FAST is allowed to differ from exact — that is the trade — but it
+        must only happen when it was asked for."""
+        disp = self.dispatcher()
+        x = np.linspace(-3, 3, HIDDEN, dtype=np.float32)
+        ids, gates = [0, 1, 2, 3, 4, 5], [0.3, 0.25, 0.2, 0.1, 0.1, 0.05]
+        exact, _ = disp.run_layer(0, x, ids, gates)
+        fast, _ = disp.run_layer(0, x, ids, gates, fast=True)
+        np.testing.assert_allclose(fast, exact, rtol=1e-5, atol=1e-6)
+
+    def test_a_console_that_collapses_without_being_asked_is_refused(self):
+        """A stale node answering a v2 coordinator must not be silently
+        accepted: its sum is arithmetically unplaceable."""
+        node = self.nodes["n0"]
+        original = node._on_expert_batch
+
+        def collapse(frame):
+            reply = original(frame)
+            rows = ExpertRowsPayload.decode(reply.payload).rows
+            return Frame(MsgType.EXPERT_RESULT, frame.request_id,
+                         encode_vector(accumulate(list(rows))),
+                         layer=frame.layer, flags=Flags.PARTIAL)
+
+        node._on_expert_batch = collapse
+        try:
+            with self.assertRaises(Gen9Error) as caught:
+                self.dispatcher(max_retries=0).run_layer(
+                    0, np.ones(HIDDEN, dtype=np.float32), [0], [1.0])
+        finally:
+            node._on_expert_batch = original
+        self.assertIn("did not ask for FAST", str(caught.exception))
 
     def test_routing_all_experts_to_one_console_still_works(self):
         disp = self.dispatcher()

@@ -59,28 +59,28 @@ class CpuKernelRunner(ExpertRunner):
         self._lib.gen9_expert_fp8.restype = None
         self._scratch: Optional[np.ndarray] = None
 
-    def __call__(self, activation: np.ndarray,
-                 experts: Sequence[ExpertWeights],
-                 gates: Sequence[float]) -> np.ndarray:
+    def rows(self, activation: np.ndarray,
+             experts: Sequence[ExpertWeights],
+             gates: Sequence[float]) -> np.ndarray:
         x = np.ascontiguousarray(activation, dtype=np.float32)
         hidden = x.size
-        out = np.zeros(hidden, dtype=np.float32)
+        out = np.empty((len(experts), hidden), dtype=np.float32)
         if not experts:
             return out
         intermediate = experts[0].gate.shape[0]
         if self._scratch is None or self._scratch.size < 2 * intermediate:
             self._scratch = np.zeros(2 * intermediate, dtype=np.float32)
         scratch = self._scratch
-        partial = np.zeros(hidden, dtype=np.float32)
 
-        for weights, gate in zip(experts, gates):
+        for index, (weights, gate) in enumerate(zip(experts, gates)):
+            # A row of a C-contiguous array is itself contiguous, so the kernel
+            # writes its expert's output straight into place.
+            row = out[index]
             if weights.quantised:
-                self._run_fp8(weights, x, partial, scratch, hidden,
-                              intermediate)
+                self._run_fp8(weights, x, row, scratch, hidden, intermediate)
             else:
-                self._run_f32(weights, x, partial, scratch, hidden,
-                              intermediate)
-            out += np.float32(gate) * partial
+                self._run_f32(weights, x, row, scratch, hidden, intermediate)
+            row *= np.float32(gate)
         return out
 
     def _run_f32(self, weights: ExpertWeights, x: np.ndarray,

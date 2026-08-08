@@ -80,11 +80,15 @@ class ShelfCoordinator:
                  placement: Placement, router: Router,
                  pool: Optional[ConnectionPool] = None,
                  request_timeout: float = 10.0,
-                 dense_layers: int = 0):
+                 dense_layers: int = 0, fast: bool = False):
         self.stage = stage
         self.addresses = addresses
         self.router = router
         self.dense_layers = dense_layers
+        #: Off by default: see :mod:`gen9_cluster.dispatch` for what turning it
+        #: on costs. It saves reply bandwidth and makes the output depend on
+        #: the current plan.
+        self.fast = fast
         self.pool = pool or ConnectionPool()
         self.dispatcher = ExpertDispatcher(placement, addresses, pool=self.pool,
                                            request_timeout=request_timeout)
@@ -134,7 +138,8 @@ class ShelfCoordinator:
         #    economic argument for MoE on hardware like this.
         expert_ids, gates = self.router(layer, state)
         routed, stats = self.dispatcher.run_layer(layer, state, expert_ids,
-                                                  gates, token=token)
+                                                  gates, token=token,
+                                                  fast=self.fast)
         self._last_stats = stats
         return state + routed
 
@@ -143,7 +148,8 @@ class FleetCoordinator:
     """Chains shelves in layer order; the front door for a whole fleet."""
 
     def __init__(self, plan, addresses: Dict[str, NodeAddress], *,
-                 router: Router, request_timeout: float = 10.0):
+                 router: Router, request_timeout: float = 10.0,
+                 fast: bool = False):
         self.plan = plan
         self.addresses = addresses
         self.pool = ConnectionPool()
@@ -153,7 +159,7 @@ class FleetCoordinator:
             ShelfCoordinator(stage, addresses, placement=placement,
                              router=router, pool=self.pool,
                              request_timeout=request_timeout,
-                             dense_layers=dense)
+                             dense_layers=dense, fast=fast)
             for stage in plan.stages
         ]
 

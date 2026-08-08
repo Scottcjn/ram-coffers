@@ -154,8 +154,11 @@ rather than one per expert. See [docs/G9XC.md](docs/G9XC.md).
 - `node.py` — the console-side worker: shard store (RAM or mmap'd NVMe),
   expert execution, block forwarding.
 - `dispatch.py` — groups a token's experts by console, one batched request each,
-  reduces the replies in a fixed order so the same prompt gives the same token,
-  and fails over to a replica when one is available.
+  reduces the per-expert replies in the router's top-k order so the same prompt
+  gives the same token *whatever console holds which expert*, and fails over to
+  a replica when one is available.
+- `dedup.py` — a bounded per-node cache keyed by batch id, so a retry after a
+  timeout is replayed rather than re-run.
 - `coordinator.py` — chains shelves in layer order. An expert-only console can
   be routed around; a shelf *host* cannot, because it owns the KV cache.
 
