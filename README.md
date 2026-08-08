@@ -205,7 +205,7 @@ Requires `-mcrypto` for `__builtin_crypto_vcipher()` / `__builtin_crypto_vcipher
 | `ggml-neuromorphic-coffers.h` | Brain hemisphere → NUMA cognitive routing |
 | `ggml-symbolic-neural-bridge.h` | PowerLISP ↔ neural integration |
 | **`apple-silicon/`** | **Apple Silicon PSE port — NEON + AES + unified memory coffers** |
-| **`gen9-cluster/`** | **DeepSeek V4 Pro across PS5 / Xbox Series consoles — coffers as a fleet** |
+| **`gen9-cluster/`** | **DeepSeek V4 Pro / Flash across PS5 / Xbox Series consoles — coffers as a fleet** |
 
 ## Ninth-Generation Console Cluster (NEW — August 2026)
 
@@ -222,14 +222,16 @@ ones wake up.
 | Xbox Series S | 8 GB @ 224 GB/s | 2 GB @ 56 GB/s | 2.4 GB/s NVMe |
 | BC-250 / 4700S / 4800S | salvage boards, further downbinned | | |
 
-Only ~4% of a 1.36 T-parameter MoE runs per token, so the other 96% only has to
-be *held* — which is what a stack of consoles is good at. Estimated 9.4 tok/s
-for DeepSeek V4 Pro at 8k context on 170 consoles. See
-[`gen9-cluster/README.md`](gen9-cluster/README.md).
+Only ~3% of a 1.6 T-parameter MoE runs per token, so the other 97% only has to
+be *held* — which is what a stack of consoles is good at. Estimated 10.8 tok/s
+for DeepSeek V4 Pro at 8k context on 170 consoles; 73 PS5s is the floor to hold
+it at all, and DeepSeek V4 Flash fits on 20. Both profiles are the published
+configurations. See [`gen9-cluster/README.md`](gen9-cluster/README.md).
 
 ```bash
 cd gen9-cluster
 python3 -m gen9_cluster size --model deepseek-v4-pro --ps5 100 --xbox-series-x 40
+python3 -m gen9_cluster size --model deepseek-v4-flash --ps5 24
 ```
 
 ## Apple Silicon Port (NEW — March 2026)

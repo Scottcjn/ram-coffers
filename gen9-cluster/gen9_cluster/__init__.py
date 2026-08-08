@@ -21,8 +21,10 @@ from .hardware import (BOARD_TO_SKU, SKUS, ComputeBackend, ConsoleSKU,
                        ConsoleUnit, Downbin, EffectiveCapability, MemoryTier,
                        Runtime, StorageSpec, FleetSummary, fleet_summary,
                        sku_for)
-from .model import (DEEPSEEK_TINY, DEEPSEEK_V3, DEEPSEEK_V4_PRO, PROFILES,
-                    MLAConfig, ModelProfile, MoEConfig, profile_for)
+from .model import (DEEPSEEK_TINY, DEEPSEEK_V3, DEEPSEEK_V4_FLASH,
+                    DEEPSEEK_V4_PRO, PROFILES, AttentionConfig,
+                    HybridAttentionConfig, MLAConfig, ModelProfile, MoEConfig,
+                    QuantSpec, profile_for)
 from .planner import (PlanningError, SplitPlan, StagePlan, UnitPlan,
                       describe_plan, plan_split)
 
@@ -32,8 +34,9 @@ __all__ = [
     "BOARD_TO_SKU", "SKUS", "ComputeBackend", "ConsoleSKU", "ConsoleUnit",
     "Downbin", "EffectiveCapability", "MemoryTier", "Runtime", "StorageSpec",
     "FleetSummary", "fleet_summary", "sku_for",
-    "DEEPSEEK_TINY", "DEEPSEEK_V3", "DEEPSEEK_V4_PRO", "PROFILES", "MLAConfig",
-    "ModelProfile", "MoEConfig", "profile_for",
+    "DEEPSEEK_TINY", "DEEPSEEK_V3", "DEEPSEEK_V4_FLASH", "DEEPSEEK_V4_PRO",
+    "PROFILES", "AttentionConfig", "HybridAttentionConfig", "MLAConfig",
+    "ModelProfile", "MoEConfig", "QuantSpec", "profile_for",
     "PlanningError", "SplitPlan", "StagePlan", "UnitPlan", "describe_plan",
     "plan_split",
     "__version__",

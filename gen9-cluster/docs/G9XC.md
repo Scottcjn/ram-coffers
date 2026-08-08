@@ -9,9 +9,9 @@ the changes ninth-generation hardware forces. Normative implementation:
 
 **A console holds many experts, not one.** A PS3 had 256 MB and held a single
 expert, so P3XC could put the expert id in the header. A PS5 holds dozens, and
-a token whose top-8 routes into three experts on one console must not cost three
+a token whose top-6 routes into three experts on one console must not cost three
 round trips. `EXPERT_BATCH` therefore names a *set* of experts with their gate
-weights and gets one `EXPERT_RESULT` back. At 74 blocks and a
+weights and gets one `EXPERT_RESULT` back. At 62 blocks and a
 quarter-millisecond hop this is the difference between ~5 ms and ~20 ms of pure
 latency per token.
 
@@ -62,7 +62,7 @@ legitimate frame is an activation (tens of KiB) or a shard chunk.
 
 Every frame carries `request_id`; a reply echoes it. The transport matches
 replies to requests by that id alone, so several requests may be in flight on
-one connection. Connections are persistent with `TCP_NODELAY` set — at 74
+one connection. Connections are persistent with `TCP_NODELAY` set — at 62
 blocks per token, connection setup or Nagle delay would dominate.
 
 Request ids are per-connection, wrap at 2³², and skip 0.
@@ -280,12 +280,13 @@ per-expert structure to reduce and falls back to summing by unit id: still
 deterministic run to run, no longer invariant under a replan.
 
 The trade is reply bandwidth. Exact mode sends `k` rows per layer where `FAST`
-sends one per console touched. At the V4-Pro profile (hidden 8192, k=8, 69 MoE
-layers) that is ~18.1 MB/token exact against ~15.4 MB/token collapsed, because
-a shelf wide enough to be worth building already scatters the top-8 across
-~6.8 consoles — the sum being collapsed is usually one or two terms long. ~17%
-of reply bandwidth is a poor price for an answer that depends on the current
-plan, which is why exact is the default and `FAST` is a flag.
+sends one per console touched. At the published V4-Pro profile (hidden 7168,
+k=6, 61 MoE layers) that is ~5.2 MB/token exact against ~4.7 MB/token
+collapsed, because a shelf wide enough to be worth building already scatters
+the top-6 across ~5.4 of its 22 consoles — the sum being collapsed is usually
+one or two terms long. ~12% of reply bandwidth is a poor price for an answer
+that depends on the current plan, which is why exact is the default and `FAST`
+is a flag.
 
 ## Versioning
 

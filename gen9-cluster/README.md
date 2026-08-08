@@ -15,43 +15,71 @@ across consoles, and DeepSeek's own MoE router decides which ones wake up.
 ```
                 shelf 0                          shelf 1
    ┌───────────────────────────────┐   ┌───────────────────────────────┐
-   │ host: Series X   layers 0-9   │   │ host: Series X   layers 10-19 │
-   │   attention + MLA KV cache    │   │                               │
-   │   router + shared expert      │──▶│   ... 74 blocks over 8 shelves│
+   │ host: Series X   layers 0-7   │   │ host: Series X   layers  8-15 │
+   │   attention + its KV cache    │   │                               │
+   │   router + shared expert      │──▶│   ... 62 blocks over 8 shelves│
    │ 21 more consoles: routed      │   │                               │
-   │   experts, ~8 lit per token   │   │                               │
+   │   experts, ~6 lit per token   │   │                               │
    └───────────────────────────────┘   └───────────────────────────────┘
 ```
 
 ## Why this is possible at all
 
-DeepSeek V4 Pro (assumed configuration — see below) is ~1345 GiB of FP8 weights
-and no console has more than 16 GB. Three properties make the fleet work
-anyway:
+DeepSeek V4 Pro is ~803 GiB of weights and no console has more than 16 GB.
+Three properties make the fleet work anyway:
 
-1. **Only ~4% of the model runs per token.** 52 of 1359 billion parameters
-   activate: attention, the router, one shared expert, and 8 of 384 routed
-   experts per layer. The other 96% only has to be *stored*, and storage is the
+1. **Only ~3% of the model runs per token.** 50 of 1600 billion parameters
+   activate: attention, the router, one shared expert, and 6 of 384 routed
+   experts per layer. The other 97% only has to be *stored*, and storage is the
    one thing a pile of consoles has.
 2. **Decode is bandwidth-bound, not compute-bound.** A PS5's 448 GB/s is what
    matters, and it is a genuinely good number — a 4700S carries the same DRAM
    on the same 256-bit bus, but reaching it from the CPU instead of the GPU
    measures 92.9 GB/s, a fifth as much, and the planner knows the difference.
-3. **FP8 is the native format.** One byte per parameter, with a scale per
-   128-element block, halves the console count against BF16 and roughly doubles
-   the token rate. `kernels/fp8.c` and `gen9_cluster/fp8.py` implement E4M3FN
-   and are tested against each other over all 256 codes.
+3. **The checkpoint ships quantised.** V4 stores its experts — which are nearly
+   all of it — in MXFP4, and everything read every token in FP8, so 1.6 T
+   parameters occupy 0.54 bytes each. That is the single biggest term in the
+   console count: V4 Pro has 2.4x V3's parameters and takes only 1.26x its
+   space. `kernels/fp8.c` and `gen9_cluster/fp8.py` implement E4M3FN and are
+   tested against each other over all 256 codes.
 
-The result is a plan, not a benchmark: **~9.4 tok/s estimated** for V4 Pro at
-8k context on 170 consoles (100 PS5 + 40 Series X + 30 BC-250). That figure is
-arithmetic over memory bandwidth, network hops, and NVMe reads. Nothing in this
-repository has run on a console yet.
+The result is a plan, not a benchmark: **~10.8 tok/s estimated** for V4 Pro at
+8k context on 170 consoles (100 PS5 + 40 Series X + 30 BC-250), and a **73-PS5
+floor** to hold it at all. V4 Flash is a fifth of the size and fits on **20**.
+Those figures are arithmetic over memory bandwidth, network hops, and NVMe
+reads. Nothing in this repository has run on a console yet.
+
+## The profiles
+
+| profile | params | activated | on disk | PS5s to hold it |
+|---|---|---|---|---|
+| `deepseek-v4-pro` | 1600 B | 50 B | 803 GiB | 73 |
+| `deepseek-v4-flash` | 291 B | 14 B | 148 GiB | 20 |
+| `deepseek-v3` | 683 B | 37 B | 638 GiB | 58 |
+| `deepseek-tiny` | — | — | 0.5 GiB | 1 (CI only) |
+
+Both V4 profiles are the published configurations, not extrapolations, and the
+tests check them against the published parameter counts. Two of their
+properties change how the planner thinks:
+
+- **Hybrid attention.** V4 alternates CSA (every 4 tokens compress to one
+  entry, then attend sparsely to the best 1024 of them) with HCA (every 128
+  tokens compress to one, attended densely), plus a sliding-window branch on
+  every layer. Neighbouring layers therefore differ by 32x in cache size, and a
+  CSA layer *reads* a small fraction of what it *holds* — so the planner sizes
+  residency and decode bandwidth separately, per layer, instead of multiplying
+  one KV figure by the layer count. The whole 1 M-token cache is 8.2 GiB, about
+  a seventh of V3's.
+- **Hyper-connections.** The residual stream is 4x hidden, so a shelf boundary
+  ships 56 KiB per token rather than 14. At 250 µs a hop that is still small
+  against a 92 ms token, but it is 4x what a V3-shaped model would cost.
 
 ## Quick start
 
 ```bash
 cd gen9-cluster
 python3 -m gen9_cluster model --model deepseek-v4-pro    # what it costs
+python3 -m gen9_cluster model --model deepseek-v4-flash  # the small one
 python3 -m gen9_cluster size  --model deepseek-v4-pro --ps5 100 \
         --xbox-series-x 40 --bc-250 30                   # how many consoles
 python3 -m gen9_cluster plan  fleet.json --config cluster.json
@@ -133,10 +161,10 @@ Four decisions, in order:
 
 1. **Shelves.** The fleet is cut into groups of ~22 consoles, dealt
    round-robin in capability order so no shelf inherits all the fast units. A
-   shelf is the expert fan-out group: a token's top-8 should be answerable
+   shelf is the expert fan-out group: a token's top-6 should be answerable
    without leaving it.
 2. **Layer ranges.** Each shelf gets a contiguous run of blocks, sized by its
-   capacity. One console per shelf is the *host*: it holds attention, the MLA KV
+   capacity. One console per shelf is the *host*: it holds attention, the KV
    cache, the router and the shared expert for those layers, and it must have
    both the room and ≥200 GB/s to do it.
 3. **Routed experts** are spread across that shelf's members, weighted by
@@ -177,11 +205,20 @@ and coordinator paths over real loopback sockets.
 **Estimated**: every throughput figure for a console. They come from datasheet
 bandwidth, the fan-out and hop structure of the plan, and NVMe read rates.
 
-**Assumed**: DeepSeek V4 Pro's configuration. No V4 Pro config is public. The
-profile here extrapolates the V2→V3 progression — 72 layers, hidden 8192, 384
-routed experts, top-8, MLA rank 512, 2 MTP heads, FP8 — and every plan it
-produces is stamped `ASSUMED CONFIGURATION`. `deepseek-v3` is a real
-configuration and is the honest thing to plan against today.
+**Read off the model cards**: both V4 configurations. `deepseek-v4-pro` and
+`deepseek-v4-flash` are the published `config.json` files, checked in the tests
+against the published parameter counts (1.6 T / 49 B activated and 284 B / 13 B).
+An earlier revision of this stack extrapolated V4 Pro from V3 and was wrong in
+almost every field; the `assumed` flag and its `ASSUMED CONFIGURATION` stamp
+remain in the code for the next unpublished model, but no shipped profile sets
+it.
+
+**Interpreted, not published**: how those fields turn into bytes. The paper
+gives the architecture, not a storage layout, so the per-layer weight counts in
+`HybridAttentionConfig.weight_params` are this repository's reading of it —
+validated against the published totals, which is a check on the sum and not on
+every term. The split between what a CSA layer *holds* and what it *reads* is
+likewise the paper's sparsity claim carried into the planner, not a measurement.
 
 **Not done**: nothing here has run on a PS5, an Xbox, or a BC-250. There is no
 D3D12 backend. The Vulkan and HIP kernels have never executed on a device.

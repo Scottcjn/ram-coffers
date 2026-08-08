@@ -1,10 +1,17 @@
 """The splitter: which console holds what, and whether it fits at all."""
 
+import dataclasses
 import unittest
 
 from gen9_cluster.hardware import GB, ConsoleUnit, Downbin, Runtime
 from gen9_cluster.model import DEEPSEEK_TINY, DEEPSEEK_V4_PRO
 from gen9_cluster.planner import PlanningError, describe_plan, plan_split
+
+#: A hypothetical unpublished model, for the paths that have to keep warning
+#: about extrapolated configurations now that both V4 profiles are published.
+ASSUMED_MODEL = dataclasses.replace(
+    DEEPSEEK_V4_PRO, name="deepseek-v5-guess", assumed=True,
+    assumptions=("nothing about this model is published",))
 
 
 def ps5_fleet(count, **kwargs):
@@ -33,9 +40,9 @@ class TestFeasibility(unittest.TestCase):
         self.assertTrue(any("nvme" in w.lower() or "ssd" in w.lower()
                             for w in plan.warnings))
 
-    def test_without_ssd_the_same_fleet_is_rejected(self):
+    def test_without_ssd_a_tight_fleet_is_rejected(self):
         with self.assertRaises(PlanningError):
-            plan_split(DEEPSEEK_V4_PRO, ps5_fleet(100), allow_ssd_tier=False)
+            plan_split(DEEPSEEK_V4_PRO, ps5_fleet(70), allow_ssd_tier=False)
 
 
 class TestShelves(unittest.TestCase):
@@ -148,9 +155,14 @@ class TestEstimates(unittest.TestCase):
         self.assertLess(tight.tokens_per_second, roomy.tokens_per_second)
 
     def test_an_assumed_model_taints_the_plan(self):
-        plan = plan_split(DEEPSEEK_V4_PRO, ps5_fleet(160))
+        plan = plan_split(ASSUMED_MODEL, ps5_fleet(160))
         self.assertTrue(plan.model_assumed)
         self.assertTrue(any("assum" in w.lower() for w in plan.warnings))
+
+    def test_a_published_model_does_not(self):
+        plan = plan_split(DEEPSEEK_V4_PRO, ps5_fleet(160))
+        self.assertFalse(plan.model_assumed)
+        self.assertFalse(any("assum" in w.lower() for w in plan.warnings))
 
 
 class TestDescription(unittest.TestCase):
@@ -159,7 +171,10 @@ class TestDescription(unittest.TestCase):
         text = "\n".join(describe_plan(plan))
         self.assertIn("shelves", text)
         self.assertIn("tok/s", text)
-        self.assertIn("ASSUMED", text)
+
+    def test_an_assumed_model_says_so_in_the_summary(self):
+        plan = plan_split(ASSUMED_MODEL, ps5_fleet(160))
+        self.assertIn("ASSUMED", "\n".join(describe_plan(plan)))
 
 
 if __name__ == "__main__":

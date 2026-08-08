@@ -7,15 +7,16 @@ dozen routed experts, so the interesting question stops being "does it fit" and
 becomes "what belongs where". This module answers it along four axes at once:
 
 1. **Pipeline, by contiguous layer range.** A stage owns consecutive decoder
-   layers so a token crosses the network once per stage, carrying one
-   ``hidden_size`` activation (16 KiB at V4-Pro width in bf16) rather than
-   anything proportional to the weights. Gigabit ethernet is the fleet's
-   scarcest resource and this is the axis that respects it.
+   layers so a token crosses the network once per stage, carrying one residual
+   state (56 KiB at V4-Pro width in bf16, four times hidden because of its
+   hyper-connections) rather than anything proportional to the weights.
+   Gigabit ethernet is the fleet's scarcest resource and this is the axis that
+   respects it.
 
 2. **Hot/cold, by coffer.** Everything an MoE layer reads for *every* token —
-   MLA attention, the router, the shared expert, the norms — is small
-   (~300 MiB at V4-Pro width) and must sit in the fastest coffer the owning
-   console has. The routed experts are ~19 GiB per layer and are read a handful
+   attention, the router, the shared expert, the norms — is small
+   (~330 MiB at V4-Pro width) and must sit in the fastest coffer the owning
+   console has. The routed experts are ~13 GiB per layer and are read a handful
    at a time, so they belong in slow coffers and on NVMe. This is the RAM
    Coffers thesis applied to a memory hierarchy the console vendors built for
    their own reasons: the Series X's 560/336 GB/s split is a hot/cold boundary
@@ -223,11 +224,17 @@ class SplitPlan:
 
 def _block_bytes(profile: ModelProfile, index: int) -> int:
     """Per-token weights of block ``index``, counting MTP heads as blocks."""
-    if index < profile.moe.n_dense_layers:
-        return profile.dense_layer_bytes()
-    if index < profile.n_layers:
-        return profile.hot_bytes_per_moe_layer()
-    return profile.mtp_hot_bytes()
+    return profile.block_bytes(index)
+
+
+def _block_need(profile: ModelProfile, index: int, context_tokens: int) -> int:
+    """What a hot host has to hold for block ``index``: weights plus its cache.
+
+    V4 interleaves attention kinds whose caches differ by a factor of 32, so
+    this is per block rather than one figure reused for every layer.
+    """
+    return (_block_bytes(profile, index)
+            + profile.block_kv_bytes(index, context_tokens))
 
 
 def _has_routed_experts(profile: ModelProfile, index: int) -> bool:
@@ -369,7 +376,6 @@ def _assign_layer_ranges(profile: ModelProfile,
     number and overflowing to NVMe.
     """
     n_blocks = profile.planning_layers
-    kv_per_layer = context_tokens * profile.mla.kv_cache_bytes_per_token("bf16")
 
     total_capacity = sum(_shelf_capacity(s, units) for s in shelves)
     if total_capacity <= 0:
@@ -403,14 +409,14 @@ def _assign_layer_ranges(profile: ModelProfile,
                 f"it is too small to be worth a layer of this model")
             continue
         first = layer
-        block_need = sum(_block_bytes(profile, first + offset) + kv_per_layer
+        block_need = sum(_block_need(profile, first + offset, context_tokens)
                          for offset in range(count))
         host = _shelf_host(shelf, units, caps, block_need)
         if host is None:
             # No member can hold every hot block for this many layers. Shrink
             # the shelf's range until one can, and push the rest onward.
             count, host = _shrink_until_hosted(profile, shelf, units, caps,
-                                               first, count, kv_per_layer)
+                                               first, count, context_tokens)
             if host is None:
                 raise PlanningError(
                     f"shelf {shelf_index} has no member able to hold even one "
@@ -434,7 +440,7 @@ def _assign_layer_ranges(profile: ModelProfile,
             if index >= profile.n_layers:
                 plan.io_pieces.append(f"mtp-head-{index - profile.n_layers}")
             plan.hot_bytes += _block_bytes(profile, index)
-            plan.kv_bytes += kv_per_layer
+            plan.kv_bytes += profile.block_kv_bytes(index, context_tokens)
         stages.append(StagePlan(stage_id=f"st-{len(stages):04d}",
                                 first_layer=first, n_layers=count,
                                 host_unit=host, expert_units=list(shelf)))
@@ -446,8 +452,9 @@ def _assign_layer_ranges(profile: ModelProfile,
         raise PlanningError(
             f"only {layer} of {n_blocks} layers could be given a hot "
             f"host; the fleet needs more consoles with a fast coffer, or a "
-            f"shorter context ({kv_per_layer / MB:.0f} MiB of KV per layer at "
-            f"{context_tokens} tokens)")
+            f"shorter context "
+            f"({profile.kv_cache_bytes(context_tokens) / profile.n_layers / MB:.0f}"
+            f" MiB of KV per layer on average at {context_tokens} tokens)")
     if len(stages) > 1:
         hops = len(stages) - 1
         warnings.append(
@@ -461,11 +468,11 @@ def _assign_layer_ranges(profile: ModelProfile,
 def _shrink_until_hosted(profile: ModelProfile, shelf: Sequence[str],
                          units: Dict[str, UnitPlan],
                          caps: Dict[str, EffectiveCapability],
-                         first: int, count: int, kv_per_layer: int
+                         first: int, count: int, context_tokens: int
                          ) -> Tuple[int, Optional[str]]:
     """Largest prefix of a shelf's range that one member can host, and who."""
     while count > 0:
-        need = sum(_block_bytes(profile, first + o) + kv_per_layer
+        need = sum(_block_need(profile, first + o, context_tokens)
                    for o in range(count))
         host = _shelf_host(shelf, units, caps, need)
         if host is not None:
@@ -664,7 +671,6 @@ def _estimate_decode(profile: ModelProfile,
     expert_bytes = profile.expert_bytes()
     top_k = profile.moe.top_k
     n_routed = profile.moe.n_routed_experts
-    kv_read = context_tokens * profile.mla.kv_cache_bytes_per_token("bf16")
     total = 0.0
     active_per_layer: List[float] = []
 
@@ -677,6 +683,9 @@ def _estimate_decode(profile: ModelProfile,
     for stage in stages:
         host_cap = caps[stage.host_unit]
         for layer in stage.layers:
+            # Under CSA the cache a layer *reads* is a small selection of the
+            # cache it holds, so the read is what decode costs, not residency.
+            kv_read = profile.block_kv_read_bytes(layer, context_tokens)
             worst = _read_seconds(host_cap,
                                   _block_bytes(profile, layer) + kv_read,
                                   "fast")

@@ -4,17 +4,43 @@ What this design borrows, and from whom. Grouped by what it was borrowed *for*.
 
 ## The model
 
+- **DeepSeek-V4.** DeepSeek-AI, 2026.
+  [arXiv:2606.19348](https://arxiv.org/abs/2606.19348).
+  The architecture both V4 profiles implement: conv-compressed self-attention
+  (CSA) interleaved with hyper-compressed attention (HCA) over shared KV
+  entries, a sliding-window branch on every layer, an FP4 lightning indexer
+  selecting which compressed entries a query attends to, manifold-constrained
+  hyper-connections widening the residual stream, hash-gated leading MoE
+  layers, and FP4 expert weights dequantised to FP8 for compute.
+  `HybridAttentionConfig` is this paper's attention; the per-layer weight terms
+  in `weight_params` are this repository's reading of it, checked against the
+  published parameter totals rather than term by term.
+- **DeepSeek-V4-Pro and DeepSeek-V4-Flash model cards.** DeepSeek-AI, 2026.
+  <https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro> and
+  <https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash>.
+  The `config.json` of each is the source of every field in `DEEPSEEK_V4_PRO`
+  and `DEEPSEEK_V4_FLASH`, including the verbatim `compress_ratios` schedule
+  that tells the planner which layers are CSA, which are HCA, and which are
+  pure sliding window. Earlier revisions of this stack extrapolated V4 Pro from
+  V3 and were wrong in nearly every field; the profiles are no longer marked
+  `assumed`, and the tests pin them to the cards' 1.6 T / 49 B and 284 B / 13 B.
 - **DeepSeek-V3 Technical Report.** DeepSeek-AI, 2024.
   [arXiv:2412.19437](https://arxiv.org/abs/2412.19437).
-  The source of the decoder shape this stack extrapolates from: MLA,
-  DeepSeekMoE with fine-grained routed experts plus an always-on shared expert,
-  auxiliary-loss-free load balancing, multi-token prediction, and native FP8
-  training. `model.py`'s `deepseek-v3` profile is this paper's configuration;
-  `deepseek-v4-pro` is an extrapolation and is marked as such in every output.
+  MLA, DeepSeekMoE with fine-grained routed experts plus an always-on shared
+  expert, auxiliary-loss-free load balancing, multi-token prediction, and
+  native FP8 training. `model.py`'s `deepseek-v3` profile is this paper's
+  configuration, and it is the calibration case: its published parameter counts
+  are what the sizing arithmetic is checked against.
 - **DeepSeek-V2.** DeepSeek-AI, 2024.
   [arXiv:2405.04434](https://arxiv.org/abs/2405.04434).
   Introduces multi-head latent attention. The compressed KV cache is why an 8k
   context is affordable here at all — see `MLAConfig.kv_cache_bytes_per_token`.
+- **OCP Microscaling Formats (MX) Specification v1.0.** Open Compute Project,
+  2023.
+  <https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf>
+  E2M1 values with one E8M0 scale per 32 elements. The scale is 6.25% on top of
+  the payload, which is the difference between 0.5 and 0.53125 bytes per expert
+  parameter and, at 1.6 T parameters, about 46 GiB — four consoles.
 - **DeepSeekMoE.** Dai et al., 2024.
   [arXiv:2401.06066](https://arxiv.org/abs/2401.06066).
   Fine-grained expert segmentation and shared-expert isolation. Small experts
