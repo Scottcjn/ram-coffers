@@ -251,6 +251,32 @@ Apple Silicon's unified memory means CPU and GPU share the same RAM — coffers 
 cd apple-silicon && make bench
 ```
 
+## x86-64 Port (August 2026)
+
+Third target for the collapse, and the only one that reproduces POWER8 exactly:
+`aesenc` and `vcipher` compute the same function, so `x86-64/aes-collapse.h` is
+a literal transcription, checked against a scalar FIPS-197 round.
+
+| POWER8 Primitive | x86-64 Equivalent |
+|-----------------|-------------------|
+| `vcipher` (AES round) | `_mm_aesenc_si128` |
+| `vcipherlast` | `_mm_aesenclast_si128` |
+| `vec_perm` (single-source) | `_mm_shuffle_epi8` |
+| `mftb` (entropy) | `rdtsc` (off by default — keys are deterministic) |
+
+Measured at 0.19 ns per round with four chains in flight, against 0.27 ns for a
+dependent `pshufb`. Two caveats worth reading before use: the ARM port is *not*
+the same function as this one or as POWER8, and mode 4's similarity metric does
+not rank similarity. Both are demonstrated by the bench. See
+[`x86-64/README.md`](x86-64/README.md).
+
+```bash
+cd x86-64 && make bench
+```
+
+`gen9-cluster` does not use it — that fleet's attention runs on RDNA2, which has
+no AES instruction.
+
 ## Fallback Behavior (non-POWER8 / single-NUMA systems)
 
 Trying the headers on an ordinary x86_64, aarch64, or single-socket box? The
