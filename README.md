@@ -453,3 +453,19 @@ The same POWER8 S824 that hits 147 t/s with RAM Coffers also mines RTC via Proof
 **[Elyan Labs](https://github.com/Scottcjn)** · [RustChain](https://rustchain.org) · [BoTTube](https://bottube.ai)
 
 </div>
+
+
+## Documentation & CI Boost
+
+### Quick Start
+```bash
+git clone https://github.com/Scottcjn/ram-coffers.git
+cd ram-coffers
+```
+
+### Enhanced Features
+- Comprehensive inline documentation
+- Automated CI pipeline with GitHub Actions
+- Test coverage for core modules
+
+*Boost contributed by Bounty Hunter*
