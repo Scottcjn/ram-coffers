@@ -448,8 +448,36 @@ The same POWER8 S824 that hits 147 t/s with RAM Coffers also mines RTC via Proof
 
 ---
 
+## Fallback Behavior
+
+`ram-coffers` is engineered for the 4-node POWER8 S824 topology, but provides deterministic fallback mechanisms on single-NUMA, non-POWER8, x86_64, and AArch64 architectures.
+
+### 1. Single-NUMA-Node Systems
+When running on single-socket or single-NUMA-node hardware:
+- **NUMA Availability**: Checked dynamically via `numa_available() < 0` (`ggml-ram-coffers.h` L269, `ggml-coffer-mmap.h` L284, `ggml-ram-coffer.h` L91).
+- **Graceful Degradation**: If `numa_available()` returns `-1` or `numa_num_configured_nodes() == 1`, memory placement defaults gracefully to node 0 (`ggml-ram-coffers.h` L532: `"WARNING: Running without NUMA support"`) without allocation failures.
+- **Placement & Migration Bypass**: Page migration calls (`mbind`, `numa_run_on_node`) log a fallback message (`ggml-coffer-mmap.h` L372: `"Coffer: NUMA not available, skipping placement"`) and proceed with standard contiguous virtual memory mmap allocation (`ggml-coffer-mmap.h` L277-L300).
+
+### 2. Non-POWER8 Architectures
+When compiled on non-POWER8 systems (e.g. x86_64, ARM64):
+- **POWER8 Vector Instructions**: `power8-compat.h` L10-L42 guards POWER8-specific vector macros (`vec_xl`, `vec_xst`) behind `#if defined(__POWER8_VECTOR__) && !defined(__POWER9_VECTOR__)`. On non-POWER8 hosts, `GGML_POWER8_COMPAT_ACTIVE` remains undefined and vector intrinsics are bypassed.
+- **Hardware DCBT Prefetching**: Data Cache Block Touch assembly instructions (`dcbt 0,%0`) are conditionally compiled under `#if defined(__powerpc64__) || defined(__powerpc__)` (`ggml-ram-coffers.h` L103-L106 & L204, `ggml-coffer-mmap.h` L410). On x86_64/ARM, these calls evaluate to safe inline NO-OPs.
+- **Linux Dependency**: NUMA-specific bindings (`libnuma`) are guarded by `#ifdef __linux__` (`ggml-ram-coffers.h` L35, L268, L294). Non-Linux platforms (macOS/Windows) fall back to standard heap and POSIX mmap allocations.
+
+### 3. Build & Runtime Compatibility Matrix
+
+| Architecture / Platform | NUMA Nodes | DCBT Prefetch | NUMA Binding (`mbind`) | Build Status | Behavior |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **POWER8 (S824) / Linux** | 4 (Multi-Node) | Active (`dcbt`) | Active (`mbind`) | **Full Support** | Optimal 4-coffer sharding & HW prefetch |
+| **POWER8 (S824) / Linux** | 1 (Single-Node)| Active (`dcbt`) | Node 0 Fallback | **Supported** | HW prefetch enabled; single-node allocation |
+| **x86_64 / Linux** | 1 or Multi-Node | NO-OP | Conditional (libnuma) | **Supported** | Standard mmap fallback; no POWER8 assembly |
+| **AArch64 (Apple Silicon / Linux)** | 1 | NO-OP | Bypassed | **Supported** | Standard POSIX allocation; scalar execution |
+
+---
+
 <div align="center">
 
 **[Elyan Labs](https://github.com/Scottcjn)** · [RustChain](https://rustchain.org) · [BoTTube](https://bottube.ai)
 
 </div>
+
