@@ -1,0 +1,89 @@
+#version 450
+/* Routed-expert GEMV as a Vulkan compute shader — the default GPU path.
+ *
+ * Why Vulkan and not HIP: a PS5 under ps5-linux and a BC-250 both present a
+ * GFX1013 amdgpu, and RADV drives that target well, while ROCm's userspace does
+ * not uniformly ship it. This shader needs nothing but core Vulkan 1.1 compute
+ * and shader-int8 arithmetic done by hand, so it runs on any RADV that comes up
+ * at all — no tuned library, no target-specific codegen, no build script that
+ * checks the gfx level and decides we are too old.
+ *
+ * The mapping: one workgroup per output row, 64 invocations per workgroup
+ * (RDNA2's wave size, so a workgroup is one wave and the subgroup reduction at
+ * the end is free of cross-wave synchronisation). Each invocation strides
+ * through the row, accumulating, then the wave reduces.
+ *
+ * FP8 E4M3 is decoded in the shader. Doing it here rather than pre-expanding to
+ * fp16 keeps the bytes crossing GDDR6 at one per weight, which is the entire
+ * reason a 16 GB console can hold a useful number of experts.
+ */
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Weights  { uint  packed[]; } W;
+layout(std430, binding = 1) readonly buffer Scales   { float scale[];  } S;
+layout(std430, binding = 2) readonly buffer Input    { float x[];      } X;
+layout(std430, binding = 3) writeonly buffer Output  { float y[];      } Y;
+
+layout(push_constant) uniform Params {
+    uint rows;
+    uint cols;          // multiple of 128
+    uint fp8;           // 0: weights are fp32 in `packed`; 1: FP8 E4M3 blocks
+    uint scales_per_row;
+} params;
+
+shared float partial[64];
+
+/* E4M3FN -> float. Bias 7, no infinities, 0x7F/0xFF are NaN (never stored). */
+float decode_e4m3(uint b)
+{
+    uint sign = (b >> 7) & 0x1u;
+    uint exp  = (b >> 3) & 0xFu;
+    uint mant = b & 0x7u;
+    float mag;
+    if (exp == 0u) {
+        mag = float(mant) * 0.125 * exp2(-6.0);      // subnormal
+    } else {
+        mag = (1.0 + float(mant) * 0.125) * exp2(float(exp) - 7.0);
+    }
+    return sign == 1u ? -mag : mag;
+}
+
+float weight_at(uint row, uint col)
+{
+    if (params.fp8 == 0u) {
+        return uintBitsToFloat(W.packed[row * params.cols + col]);
+    }
+    uint index = row * params.cols + col;
+    uint word = W.packed[index >> 2];
+    uint byte = (word >> (8u * (index & 3u))) & 0xFFu;
+    uint block = (row * params.scales_per_row) + (col >> 7);
+    return decode_e4m3(byte) * S.scale[block];
+}
+
+void main()
+{
+    uint row = gl_WorkGroupID.x;
+    if (row >= params.rows) {
+        return;
+    }
+    uint lane = gl_LocalInvocationID.x;
+
+    float sum = 0.0;
+    for (uint col = lane; col < params.cols; col += 64u) {
+        sum += weight_at(row, col) * X.x[col];
+    }
+
+    partial[lane] = sum;
+    barrier();
+    /* Tree reduction within the wave. */
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        Y.y[row] = partial[0];
+    }
+}

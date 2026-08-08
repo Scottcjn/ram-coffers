@@ -205,6 +205,32 @@ Requires `-mcrypto` for `__builtin_crypto_vcipher()` / `__builtin_crypto_vcipher
 | `ggml-neuromorphic-coffers.h` | Brain hemisphere → NUMA cognitive routing |
 | `ggml-symbolic-neural-bridge.h` | PowerLISP ↔ neural integration |
 | **`apple-silicon/`** | **Apple Silicon PSE port — NEON + AES + unified memory coffers** |
+| **`gen9-cluster/`** | **DeepSeek V4 Pro across PS5 / Xbox Series consoles — coffers as a fleet** |
+
+## Ninth-Generation Console Cluster (NEW — August 2026)
+
+Coffers taken one level up: a coffer becomes a *memory tier inside a console*,
+and the fleet is a coffer hierarchy several hundred banks wide. The routing that
+POWER8 does across NUMA nodes, a fleet of PlayStation 5 and Xbox Series X/S
+consoles does across machines — with DeepSeek's own MoE router deciding which
+ones wake up.
+
+| Console coffer | Fast tier | Slow tier | Cold tier |
+|---|---|---|---|
+| Xbox Series X | 10 GB @ 560 GB/s | 3.5 GB @ 336 GB/s | 2.4 GB/s NVMe |
+| PS5 / Slim | 16 GB @ 448 GB/s | — | 5.5 GB/s NVMe |
+| Xbox Series S | 8 GB @ 224 GB/s | 2 GB @ 56 GB/s | 2.4 GB/s NVMe |
+| BC-250 / 4700S / 4800S | salvage boards, further downbinned | | |
+
+Only ~4% of a 1.36 T-parameter MoE runs per token, so the other 96% only has to
+be *held* — which is what a stack of consoles is good at. Estimated 9.4 tok/s
+for DeepSeek V4 Pro at 8k context on 170 consoles. See
+[`gen9-cluster/README.md`](gen9-cluster/README.md).
+
+```bash
+cd gen9-cluster
+python3 -m gen9_cluster size --model deepseek-v4-pro --ps5 100 --xbox-series-x 40
+```
 
 ## Apple Silicon Port (NEW — March 2026)
 
