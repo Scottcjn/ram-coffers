@@ -427,6 +427,174 @@ This repository is header-focused; there is no single build script yet. A fast w
 2. Follow `ggml-coffer-mmap.h` for sharding/memory-mapping details.
 3. Read `power8-compat.h` + `ggml-topk-collapse-vsx.h` for ISA-specific optimizations.
 
+## Fallback Behavior
+
+RAM Coffers is designed and tested on a POWER8 S824 with 4 NUMA nodes. On other
+hardware configurations the code degrades gracefully — the routing and activation
+logic still works, but POWER8-specific optimisations become no-ops and NUMA
+features adapt to available topology.
+
+### Single-NUMA-Node Systems
+
+When the host has only one NUMA node (the common case on consumer desktops,
+laptops, and non-server hardware), the following adaptations occur:
+
+- **`coffer_init_numa()`** calls `numa_num_configured_nodes()` and initialises
+  only `min(MAX_COFFERS, n_nodes)` coffers. On a single-node system only
+  **Coffer 0** is populated; coffers 1–3 remain in their zeroed, unloaded
+  state (`is_loaded = 0`).
+- **`route_to_coffer()`** skips any coffer where `is_loaded == 0`, so it
+  always returns coffer 0 regardless of the query embedding.
+- **`activate_coffer_ex()`** still runs `numa_run_on_node()` (guarded by
+  `#ifdef __linux__`), but since there is only node 0 the call is a no-op
+  on that kernel — the thread is already running on the only node.
+- **`coffer_load_shard()`** calls `set_mempolicy(MPOL_BIND, …)` with the
+  single-node mask. All allocations land on node 0, which is correct.
+- The hardcoded `NUMA_TO_COFFER` / `COFFER_TO_NUMA` tables (lines 50–51)
+  are designed for a 4-node topology but cause no harm on a single node —
+  entries beyond node 0 simply map to coffers that were never loaded.
+
+A warning banner is printed during initialisation if NUMA is unavailable
+or has fewer than 4 nodes:
+
+```
+║  WARNING: Running without NUMA support                      ║
+```
+
+Execution continues normally; the coffer system operates as a single-bank
+memory router with all the resonance routing logic intact.
+
+### Non-POWER8 Architectures
+
+Three POWER8-specific primitives are used in the codebase. Each has a
+compile-time fallback for other ISAs:
+
+#### 1. DCBT Prefetch (Data Cache Block Touch)
+
+Defined as macros in `ggml-ram-coffers.h` (lines 103–111):
+
+```c
+#if defined(__powerpc64__) || defined(__powerpc__)
+#define DCBT_PREFETCH(addr)      __asm__ __volatile__("dcbt 0,%0" : : "r"(addr))
+#define DCBT_STREAM_START(...)   __asm__ __volatile__("dcbt 0,%0,%1" : : …)
+#define DCBT_STREAM_STOP(id)     __asm__ __volatile__("dcbt 0,0,%0" : : …)
+#else
+#define DCBT_PREFETCH(addr)      (void)(addr)
+#define DCBT_STREAM_START(...)   (void)(addr)
+#define DCBT_STREAM_STOP(id)     (void)0
+#endif
+```
+
+On non-POWER architectures every `DCBT_PREFETCH` becomes a no-op that
+evaluates its argument (preventing unused-variable warnings) and does
+nothing else. The `dcbt_resident()` loop still iterates over the memory
+region, but since the inner macro is a no-op, it burns CPU cycles without
+any actual prefetch effect.
+
+#### 2. AltiVec vec\_perm (SIMD Dot Product)
+
+The `dot_product()` function in `ggml-ram-coffers.h` (lines 202–226) uses
+`#if defined(__powerpc64__) || defined(__powerpc__)` to select between
+AltiVec vector code and a plain scalar loop:
+
+```c
+#if defined(__powerpc64__) || defined(__powerpc__)
+    #include <altivec.h>
+    // vector float operations using vec_ld, vec_madd, vec_sld, vec_ste
+#else
+    for (int d = 0; d < dim; d++) {
+        sum += a[d] * b[d];
+    }
+#endif
+```
+
+On x86_64, aarch64, and any other non-POWER ISA the fallback is a
+straightforward C loop. The same applies to `cosine_similarity()` and
+`magnitude()` which call `dot_product()` internally — the scalar path
+works identically, just without vector acceleration.
+
+Note: `ggml-topk-collapse-vsx.h` includes `<altivec.h>` unconditionally
+(line 19). It will **not** compile on non-POWER toolchains. That file is
+only relevant on POWER8 systems.
+
+#### 3. PowerPC Timebase (mftb) — Hardware Entropy
+
+The `mftb` instruction reads the POWER8 processor timebase for hardware
+entropy injection. Each file that uses it provides a platform-specific
+fallback chain:
+
+| File | POWER8 | x86\_64 | aarch64 | Other (last resort) |
+|------|--------|---------|---------|---------------------|
+| `ggml-ram-coffers.h` | `mftb` | — (not used) | — (not used) | — (not used) |
+| `ggml-topk-collapse-vsx.h` | `mftb` | `return 0` | `return 0` | `return 0` |
+| `pse-entropy-burst.h` | `mftb` | `rdtsc` | `cntvct_el0` | `\&g_pse_token_pos` (address of static) |
+
+- **`topk_read_timebase()`** returns `0` on non-POWER (details in
+  `ggml-topk-collapse-vsx.h` lines 47–55). Entropy-dependent features
+  degrade to deterministic behaviour.
+- **`pse_read_timebase()`** (`pse-entropy-burst.h` lines 64–80) has a richer
+  fallback: x86\_64 uses `rdtsc`, aarch64 uses the virtual counter register
+  (`cntvct_el0`), and unknown platforms fall back to the address of a static
+  variable — which is weak entropy but compiles everywhere.
+
+#### 4. NUMA Header Availability
+
+NUMA support is guarded inconsistently across files:
+
+- **`ggml-ram-coffers.h`** (multi-bank): Includes `<numa.h>` / `<numaif.h>`
+  only under `#ifdef __linux__` (lines 36–39). Safe on macOS, BSD, etc.
+- **`ggml-ram-coffer.h`** (single coffer): Includes `<numa.h>` and
+  `<numaif.h>` **unconditionally** (lines 25–27). Will fail to compile
+  on non-Linux systems without `libnuma`.
+- **`ggml-coffer-mmap.h`**: Same — unconditional `#include <numa.h>` /
+  `#include <numaif.h>` (lines 27–28). Non-Linux builds will error.
+
+On Linux, if `libnuma` is installed, the NUMA calls execute normally. If
+`numa_available()` returns `< 0`, a warning is printed and the coffer
+system falls back to unbound memory allocation.
+
+#### 5. power8-compat.h
+
+This header provides `vec_xl` / `vec_xst` / `vec_xl_len` macros for
+POWER8 toolchains that lack the POWER9 `vec_xl` family. It is entirely
+gated behind:
+
+```c
+#if defined(__POWER8_VECTOR__) && !defined(__POWER9_VECTOR__)
+```
+
+On non-POWER toolchains the header produces nothing — it is empty. It
+is only included from code that already guards on POWER8, so a
+non-POWER build will never pull it in.
+
+### Build Matrix
+
+The following table summarises what works on each platform. *Compile* means
+the header compiles without errors given a suitable environment (e.g.
+`libnuma` on Linux); *Feature* columns show whether the optimisation is
+active or degraded.
+
+| Platform | Compiles | NUMA | DCBT Prefetch | vec\_perm dot | mftb Entropy | Notes |
+|----------|----------|------|---------------|---------------|--------------|-------|
+| **POWER8, multi-node Linux** | ✅ | ✅ Full (4 nodes) | ✅ Native `dcbt` | ✅ AltiVec | ✅ Real timebase | Primary target; 147 t/s |
+| **POWER8, single-node Linux** | ✅ | ✅ Single node | ✅ Native `dcbt` | ✅ AltiVec | ✅ Real timebase | Coffer 0 only; same perf |
+| **x86\_64, Linux** | ✅ (with libnuma) | ✅ (if available) | ❌ No-op | ❌ Scalar loop | ❌ → `rdtsc` | Full routing but no DCBT/VSX |
+| **aarch64, Linux** | ✅ (with libnuma) | ✅ (if available) | ❌ No-op | ❌ Scalar loop | ❌ → `cntvct_el0` | Apple Silicon has own port |
+| **macOS (Apple Silicon)** | ❌\* | ❌ (no libnuma) | ❌ No-op | ❌ Scalar loop | ❌ → `cntvct_el0` | See `apple-silicon/` port |
+
+\* `ggml-ram-coffers.h` compiles on macOS (NUMA headers guarded with
+`#ifdef __linux__`), but `ggml-ram-coffer.h` and `ggml-coffer-mmap.h`
+fail due to unconditional `#include <numa.h>`. The standalone
+`apple-silicon/` port provides a separate, cache-tier-based coffer
+implementation for macOS.
+
+**Key takeaway**: The resonance routing logic (`route_to_coffer`,
+`cosine_similarity`, `coffer_add_domain`) is fully portable C and works
+identically on every platform. Only the performance optimisations
+(DCBT, vec_perm, mftb) are POWER8-specific. The coffer system itself —
+selection, activation, prune planning — degrades gracefully without
+them.
+
 ## The Proof of Physical AI Stack
 
 RAM Coffers is part of a vertically integrated DePIN system where **the hardware that runs inference also earns tokens**:
