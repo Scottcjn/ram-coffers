@@ -206,19 +206,30 @@ Requires `-mcrypto` for `__builtin_crypto_vcipher()` / `__builtin_crypto_vcipher
 | `ggml-symbolic-neural-bridge.h` | PowerLISP ↔ neural integration |
 | **`apple-silicon/`** | **Apple Silicon PSE port — NEON + AES + unified memory coffers** |
 
+## Fallback and Portability Contract
+
+The canonical fallback/portability reference lives in
+**[`docs/FALLBACK_BEHAVIOR.md`](docs/FALLBACK_BEHAVIOR.md)**.
+
+Short version:
+- `ggml-ram-coffers.h` is the main header with a real single-NUMA fallback path
+  when libnuma is available at build time but the machine reports no NUMA.
+- `ggml-ram-coffer.h` and `ggml-coffer-mmap.h` also check `numa_available()` at
+  runtime, but they still unconditionally include `<numa.h>`, so they are not
+  repository-wide promises of macOS/Windows portability.
+- Apple Silicon support is a separate port under
+  [`apple-silicon/`](apple-silicon/README.md), where cache tiers replace NUMA
+  nodes.
+- Single-NUMA or non-POWER8 runs are correctness/smoke-test paths unless a
+  component-specific document says otherwise.
+
+If you are deciding what to build or benchmark on a new machine, use the
+per-component matrix in `docs/FALLBACK_BEHAVIOR.md`, not a repo-wide inference
+from one README paragraph.
+
 ## Apple Silicon Port (NEW — March 2026)
 
 Non-bijunctive collapse ported to Apple M-series chips, proving the technique is **architecture-general**.
-
-| POWER8 Primitive | Apple Silicon Equivalent | Cycles |
-|-----------------|-------------------------|--------|
-| `vec_perm` (dual-source) | `vqtbl2q_u8` | 1 |
-| `vcipher` (AES round) | `vaeseq_u8` + `vaesmcq_u8` | 2 |
-| `mftb` (entropy) | `cntvct_el0` | 1 |
-| `dcbt` (prefetch) | `prfm PLDL1KEEP` | 1 |
-| NUMA coffers (4 nodes) | Cache-tier coffers (L1/L2/SLC/DRAM) | — |
-
-Apple Silicon's unified memory means CPU and GPU share the same RAM — coffers become cache-tier aware instead of NUMA-aware. See [`apple-silicon/README.md`](apple-silicon/README.md) for details.
 
 ```bash
 # Build and run benchmark on Mac
