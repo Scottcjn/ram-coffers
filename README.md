@@ -367,6 +367,54 @@ environment file, the exact stock and RAM Coffers commits, the model URL/path,
 only for smoke testing. Single-NUMA or non-POWER8 runs are correctness/shape
 checks and should not be presented as POWER8 performance reproductions.
 
+
+
+## Fallback Behavior (Non-POWER8 / Single-NUMA Systems)
+
+### POWER8 S824 (4-NUMA Nodes) — Primary Target
+The project is designed for the **POWER8 S824** with 4 NUMA nodes and 544GB total RAM. Each NUMA node maps to a "coffer" (weight bank), and the coffer routing logic distributes model weights across nodes using `mbind()` for page migration.
+
+### Single-NUMA-Node Systems
+When running on a system with only **one NUMA node** (e.g., single-socket servers, most x86 desktops, cloud VMs):
+
+- **All coffers collapse to the single available node.** The multi-bank routing becomes a no-op — all weight pages are allocated on the same NUMA node.
+- **No `mbind()` calls are made** since there is no alternative node to migrate to.
+- **Performance degrades gracefully** — you lose the NUMA-aware prefetch and cache-line isolation, but the code still functions correctly.
+- Memory allocation falls through to standard `mmap()` / `malloc()` behavior.
+
+### Apple Silicon (Unified Memory)
+Apple Silicon chips (M1/M2/M3/M4) use **Unified Memory Architecture** — CPU and GPU share the same physical RAM pool with no NUMA topology.
+
+- **NUMA coffer routing is replaced with cache-tier banking** (see `apple-silicon/unified-memory-coffers.h`).
+- The 4 coffers map to **L1 cache, L2 cache, system RAM, and swap** tiers instead of physical NUMA nodes.
+- PSE collapse uses **ARM NEON** (`vqtbl1q_u8`/`vqtbl2q_u8`) instead of POWER8 `vec_perm`.
+- AES entropy uses **ARM Crypto Extensions** (`vaeseq_u8`) instead of POWER8 `vcipher`.
+
+### x86 Systems
+On **x86/amd64** (Intel/AMD) without POWER8 ISA support:
+
+- **Compilation will fail** — the core headers require POWER8 vector intrinsics (`vec_perm`, `vcipher`, `vec_xl`).
+- The `power8-compat.h` header provides compatibility macros but does not emulate the POWER8 instructions on x86.
+- For x86 use, consider the Apple Silicon port as a reference for implementing SIMD collapse with SSE/AVX intrinsics, though this is not currently provided.
+
+### Non-POWER8 ppc64le (e.g., POWER9, POWER10)
+On newer POWER processors:
+
+- **POWER9/POWER10** have the required vector instructions plus additional capabilities. The code should compile and run with POWER8 compatibility mode (`-mcpu=power8`).
+- Define `__POWER8_VECTOR__` explicitly if your compiler doesn't auto-detect.
+- **Do NOT define `__POWER9_VECTOR__`** — this enables GCC to use POWER9 builtins that may conflict with the explicit vec_perm/vcipher usage.
+
+### Summary Table
+
+| System | NUMA Coffers | PSE Collapse | Status |
+|--------|-------------|--------------|--------|
+| POWER8 S824 (4-node) | Full multi-bank routing | vec_perm + vcipher | ✅ Primary target |
+| POWER9/POWER10 | Full multi-bank routing | vec_perm + vcipher (compat) | ✅ Works |
+| Single-NUMA ppc64le | Single-bank (all collapsed) | vec_perm + vcipher | ✅ Works with reduced perf |
+| Apple Silicon | Cache-tier banking | NEON + AES crypto | ✅ Works (see apple-silicon/) |
+| x86 (Intel/AMD) | N/A | N/A | ❌ Compile error |
+| ARM (non-Apple) | N/A | N/A | ❌ Not supported |
+
 ## License
 
 GNU AGPL v3.0 - see [LICENSE](LICENSE) for the full terms.
