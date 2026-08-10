@@ -207,6 +207,34 @@ Requires `-mcrypto` for `__builtin_crypto_vcipher()` / `__builtin_crypto_vcipher
 | `ggml-neuromorphic-coffers.h` | Brain hemisphere → NUMA cognitive routing |
 | `ggml-symbolic-neural-bridge.h` | PowerLISP ↔ neural integration |
 | **`apple-silicon/`** | **Apple Silicon PSE port — NEON + AES + unified memory coffers** |
+| **`gen9-cluster/`** | **DeepSeek V4 Pro / Flash across PS5 / Xbox Series consoles — coffers as a fleet** |
+
+## Ninth-Generation Console Cluster (NEW — August 2026)
+
+Coffers taken one level up: a coffer becomes a *memory tier inside a console*,
+and the fleet is a coffer hierarchy several hundred banks wide. The routing that
+POWER8 does across NUMA nodes, a fleet of PlayStation 5 and Xbox Series X/S
+consoles does across machines — with DeepSeek's own MoE router deciding which
+ones wake up.
+
+| Console coffer | Fast tier | Slow tier | Cold tier |
+|---|---|---|---|
+| Xbox Series X | 10 GB @ 560 GB/s | 3.5 GB @ 336 GB/s | 2.4 GB/s NVMe |
+| PS5 / Slim | 16 GB @ 448 GB/s | — | 5.5 GB/s NVMe |
+| Xbox Series S | 8 GB @ 224 GB/s | 2 GB @ 56 GB/s | 2.4 GB/s NVMe |
+| BC-250 / 4700S / 4800S | salvage boards, further downbinned | | |
+
+Only ~3% of a 1.6 T-parameter MoE runs per token, so the other 97% only has to
+be *held* — which is what a stack of consoles is good at. Estimated 10.8 tok/s
+for DeepSeek V4 Pro at 8k context on 170 consoles; 73 PS5s is the floor to hold
+it at all, and DeepSeek V4 Flash fits on 20. Both profiles are the published
+configurations. See [`gen9-cluster/README.md`](gen9-cluster/README.md).
+
+```bash
+cd gen9-cluster
+python3 -m gen9_cluster size --model deepseek-v4-pro --ps5 100 --xbox-series-x 40
+python3 -m gen9_cluster size --model deepseek-v4-flash --ps5 24
+```
 
 ## Apple Silicon Port (NEW — March 2026)
 
@@ -226,6 +254,32 @@ Apple Silicon's unified memory means CPU and GPU share the same RAM — coffers 
 # Build and run benchmark on Mac
 cd apple-silicon && make bench
 ```
+
+## x86-64 Port (August 2026)
+
+Third target for the collapse, and the only one that reproduces POWER8 exactly:
+`aesenc` and `vcipher` compute the same function, so `x86-64/aes-collapse.h` is
+a literal transcription, checked against a scalar FIPS-197 round.
+
+| POWER8 Primitive | x86-64 Equivalent |
+|-----------------|-------------------|
+| `vcipher` (AES round) | `_mm_aesenc_si128` |
+| `vcipherlast` | `_mm_aesenclast_si128` |
+| `vec_perm` (single-source) | `_mm_shuffle_epi8` |
+| `mftb` (entropy) | `rdtsc` (off by default — keys are deterministic) |
+
+Measured at 0.19 ns per round with four chains in flight, against 0.27 ns for a
+dependent `pshufb`. Two caveats worth reading before use: the ARM port is *not*
+the same function as this one or as POWER8, and mode 4's similarity metric does
+not rank similarity. Both are demonstrated by the bench. See
+[`x86-64/README.md`](x86-64/README.md).
+
+```bash
+cd x86-64 && make bench
+```
+
+`gen9-cluster` does not use it — that fleet's attention runs on RDNA2, which has
+no AES instruction.
 
 ## Fallback Behavior (non-POWER8 / single-NUMA systems)
 
