@@ -49,6 +49,13 @@
 /* Amplification factor for winners */
 #ifndef VCIPHER_COLLAPSE_AMPLIFY
 #define VCIPHER_COLLAPSE_AMPLIFY 1.15f
+
+/* Prune below this. Energy is the sum of a float's four post-vcipher
+ * bytes, so the midpoint of 4*255 is 510. The previous literal 384 was
+ * tuned for a three-byte sum and is not the same threshold. */
+#ifndef VCIPHER_COLLAPSE_ENERGY_THRESHOLD
+#define VCIPHER_COLLAPSE_ENERGY_THRESHOLD 510
+#endif
 #endif
 
 /* Enable cross-head MixColumns fusion (0 = use vcipherlast instead) */
@@ -276,15 +283,33 @@ static inline void vcipher_collapse_8way(
          * The S-box non-linearity means similar scores map to very
          * different ranks, preventing ties and forcing decisive selection. */
         float amp = VCIPHER_COLLAPSE_AMPLIFY;
-        for (int j = 0; j < 4; j++) {
-            /* Sum the 4 bytes of each float's representation after vcipher.
-             * Higher sum = more "activated" by the non-linear transform. */
-            int idx = (i+0)*4 + j;
-            uint16_t energy0 = r0[j*1] + r0[j*1+4] + r0[j*1+8];  /* Simplified energy */
-            if (energy0 < 384) scores[idx] = 0.0f;      /* Prune */
-            else               scores[idx] *= amp;        /* Amplify */
+
+        /* Apply the ranking to ALL EIGHT vectors.
+         *
+         * This previously ranked r0 only and was followed by the comment
+         * "... same for vectors 1-7 (unrolled in production)". The loop still
+         * advanced by eight, so seven eighths of every input passed through
+         * completely untouched while the function reported having collapsed
+         * all of it. Loading, ciphering and extracting r1..r7 and then
+         * discarding them also meant the cost was paid without the effect.
+         * Found by @erkinalp while porting this to AES-NI (ram-coffers#685).
+         *
+         * The byte indexing is also corrected. Each float occupies bytes
+         * [j*4 .. j*4+3] of the 16-byte state, but the old expression read
+         * r0[j], r0[j+4], r0[j+8] — a stride of one, which sampled bytes
+         * belonging to three different floats and summed only three of the
+         * four. Energy is now the full four bytes of the float it ranks.
+         */
+        const unsigned char* rs[8] = { r0, r1, r2, r3, r4, r5, r6, r7 };
+        for (int v = 0; v < 8; v++) {
+            const unsigned char* rv = rs[v];
+            for (int j = 0; j < 4; j++) {
+                int idx = (i + v) * 4 + j;
+                uint16_t energy = (uint16_t)rv[j*4] + rv[j*4+1] + rv[j*4+2] + rv[j*4+3];
+                if (energy < VCIPHER_COLLAPSE_ENERGY_THRESHOLD) scores[idx] = 0.0f;
+                else                                            scores[idx] *= amp;
+            }
         }
-        /* ... same for vectors 1-7 (unrolled in production) */
     }
 }
 
@@ -408,10 +433,24 @@ static inline void vcipher_hybrid_collapse(
  *
  * Instead of computing dot products, we XOR Q and K vectors and pass
  * them through vcipher rounds. The AES diffusion creates a non-linear
- * similarity measure: similar Q,K produce similar vcipher outputs,
- * dissimilar ones produce maximally different outputs (avalanche).
+ * WHAT THIS ACTUALLY IS: a deterministic 12-bit hash of Q^K that detects
+ * EQUALITY and nothing weaker. It is NOT a similarity measure and must not be
+ * substituted for a dot product.
  *
- * This replaces O(d) dot product with O(1) vcipher instruction.
+ * The original claim here was that similar Q,K XOR to near zero and therefore
+ * produce low output energy. Measured over 200k Q/K pairs by @erkinalp while
+ * porting to AES-NI (ram-coffers#685), the correlation between this score and
+ * cosine similarity is +0.002, and the score for Q == K sits mid-range among
+ * unrelated pairs.
+ *
+ * Avalanche is the reason, and it is the very property the mode is built on:
+ * a single flipped input bit diffuses across the whole state, which destroys
+ * any monotonic relation between input distance and output byte sum. SubBytes
+ * maps 0x00 to 0x63, so even an exactly-zero XOR does not yield low energy.
+ *
+ * Kept rather than deleted because the ARM and x86 ports both ship it and a
+ * silent divergence between ports would be worse than a loud caveat. Use it
+ * where an equality/bucketing hash is wanted. Do not use it for ranking.
  *===========================================================================*/
 
 static inline uint32_t vcipher_attention_score(
@@ -425,14 +464,15 @@ static inline uint32_t vcipher_attention_score(
     memcpy(&k_raw, K_vec, 16);
     vector unsigned long long state = vec_xor(q_raw, k_raw);
 
-    /* Apply vcipher: near-zero input (similar Q,K) → specific S-box output.
-     * The further apart Q and K are, the more diffused the output.
-     * This is a non-linear similarity metric. */
+    /* Apply vcipher. NOTE: this does not preserve distance — avalanche means
+     * a one-bit change in Q^K rewrites the whole output. See the header note:
+     * this is an equality hash, not a similarity metric. */
     vector unsigned long long rk = vc_make_round_key(layer_id, position);
     state = __builtin_crypto_vcipher(state, rk);
 
-    /* Reduce 128-bit output to 32-bit score.
-     * Lower "energy" (byte sum) = more similar Q,K = higher attention. */
+    /* Reduce the 128-bit output to a 32-bit bucket. The byte sum carries no
+     * ordering information about how close Q and K were; identical inputs
+     * reproduce an identical score, and that is the only guarantee. */
     unsigned char bytes[16];
     memcpy(bytes, &state, 16);
 
