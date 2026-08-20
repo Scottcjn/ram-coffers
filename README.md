@@ -1,6 +1,6 @@
 # RAM Coffers: NUMA-Distributed Conditional Memory for LLM Inference
 
-RAM Coffers is a NUMA-aware conditional memory architecture for LLM inference that routes model knowledge through physical memory banks so verified POWER8 and Apple Silicon-class machines can do useful AI work inside the RustChain Proof of Physical AI ecosystem.
+RAM Coffers is LLM infrastructure for inference cost reduction: a NUMA-aware conditional memory architecture that routes model knowledge through physical memory banks, so self-hosted enterprise hardware — refurbished IBM POWER8, Apple Silicon-class machines — serves models locally with no cloud API dependency. It is zero-abstraction LLMOps: the routing layer is the hardware topology itself, measured at 147 tokens/sec (8.8x stock llama.cpp). Verified machines doing this work earn inside the RustChain Proof of Physical AI ecosystem.
 
 > **Part of the [Proof of Physical AI](https://github.com/Scottcjn/Rustchain) stack** — where real hardware earns real tokens.
 
