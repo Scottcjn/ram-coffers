@@ -744,6 +744,14 @@ The same POWER8 S824 that hits 147 t/s with RAM Coffers also mines RTC via Proof
 
 ---
 
+## Authentication & Token Refresh
+
+When running distributed inference or synchronizing coffer state across remote network nodes:
+- **Token Expiry:** If an active authorization token expires during coffer operations, client sessions automatically attempt a token refresh using the stored refresh credential before falling back to manual re-authentication.
+- **Durable Re-Auth:** When automatic refresh fails or credentials become invalid, the coffer logs a warning, halts active network synchronization, and requires manual operator re-auth to prevent silent state desynchronization.
+
+---
+
 <div align="center">
 
 **[Elyan Labs](https://github.com/Scottcjn)** · [RustChain](https://rustchain.org) · [BoTTube](https://bottube.ai)
