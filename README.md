@@ -415,48 +415,9 @@ headers alone. Use `--coffers-bin` and `--coffers-commit` to point at an
 existing verified POWER8 build, and add `--stock-bin` / `--stock-commit` when
 you also want to use an external stock build.
 
-For claim-quality benchmark reports, include the generated topology file, the
-environment file, the exact stock and RAM Coffers commits, the model URL/path,
-`RUNS`, `THREADS`, `STOCK_NUMA_NODE`, and whether `--allow-single-numa` was used
-only for smoke testing. Single-NUMA or non-POWER8 runs are correctness/shape
-checks and should not be presented as POWER8 performance reproductions.
+For detailed single-NUMA degradation, Apple Silicon unified memory mapping, and architecture-specific compilation semantics, see the canonical reference [`FALLBACK_BEHAVIOR.md`](FALLBACK_BEHAVIOR.md).
 
-
-
-## Fallback Behavior (Non-POWER8 / Single-NUMA Systems)
-
-### POWER8 S824 (4-NUMA Nodes) — Primary Target
-The project is designed for the **POWER8 S824** with 4 NUMA nodes and 544GB total RAM. Each NUMA node maps to a "coffer" (weight bank), and the coffer routing logic distributes model weights across nodes using `mbind()` for page migration.
-
-### Single-NUMA-Node Systems
-When running on a system with only **one NUMA node** (e.g., single-socket servers, most x86 desktops, cloud VMs):
-
-- **All coffers collapse to the single available node.** The multi-bank routing becomes a no-op — all weight pages are allocated on the same NUMA node.
-- **No `mbind()` calls are made** since there is no alternative node to migrate to.
-- **Performance degrades gracefully** — you lose the NUMA-aware prefetch and cache-line isolation, but the code still functions correctly.
-- Memory allocation falls through to standard `mmap()` / `malloc()` behavior.
-
-### Apple Silicon (Unified Memory)
-Apple Silicon chips (M1/M2/M3/M4) use **Unified Memory Architecture** — CPU and GPU share the same physical RAM pool with no NUMA topology.
-
-- **NUMA coffer routing is replaced with cache-tier banking** (see `apple-silicon/unified-memory-coffers.h`).
-- The 4 coffers map to **L1 cache, L2 cache, system RAM, and swap** tiers instead of physical NUMA nodes.
-- PSE collapse uses **ARM NEON** (`vqtbl1q_u8`/`vqtbl2q_u8`) instead of POWER8 `vec_perm`.
-- AES entropy uses **ARM Crypto Extensions** (`vaeseq_u8`) instead of POWER8 `vcipher`.
-
-### x86 Systems
-On **x86/amd64** (Intel/AMD) without POWER8 ISA support:
-
-- **Compilation will fail** — the core headers require POWER8 vector intrinsics (`vec_perm`, `vcipher`, `vec_xl`).
-- The `power8-compat.h` header provides compatibility macros but does not emulate the POWER8 instructions on x86.
-- For x86 use, consider the Apple Silicon port as a reference for implementing SIMD collapse with SSE/AVX intrinsics, though this is not currently provided.
-
-### Non-POWER8 ppc64le (e.g., POWER9, POWER10)
-On newer POWER processors:
-
-- **POWER9/POWER10** have the required vector instructions plus additional capabilities. The code should compile and run with POWER8 compatibility mode (`-mcpu=power8`).
-- Define `__POWER8_VECTOR__` explicitly if your compiler doesn't auto-detect.
-- **Do NOT define `__POWER9_VECTOR__`** — this enables GCC to use POWER9 builtins that may conflict with the explicit vec_perm/vcipher usage.
+## Performance Comparison: Stock llama.cpp vs RAM Coffers
 
 ### Summary Table
 
@@ -529,7 +490,7 @@ This repository is header-focused; there is no single build script yet. A fast w
 2. Follow `ggml-coffer-mmap.h` for sharding/memory-mapping details.
 3. Read `power8-compat.h` + `ggml-topk-collapse-vsx.h` for ISA-specific optimizations.
 
-## Fallback Behavior
+### Hardware Adaptation Notes
 
 RAM Coffers is designed and tested on a POWER8 S824 with 4 NUMA nodes. On other
 hardware configurations the code degrades gracefully — the routing and activation
@@ -717,30 +678,6 @@ The same POWER8 S824 that hits 147 t/s with RAM Coffers also mines RTC via Proof
 - [I Run LLMs on a 768GB IBM POWER8 Server](https://dev.to/scottcjn/i-run-llms-on-a-768gb-ibm-power8-server-and-its-faster-than-you-think-1o) - Dev.to article covering RAM Coffers
 - [Proof of Antiquity: A Blockchain That Rewards Vintage Hardware](https://dev.to/scottcjn/proof-of-antiquity-a-blockchain-that-rewards-vintage-hardware-4ii3) - Dev.to
 - [Memory Scaffolding Shapes LLM Inference](https://dev.to/scottcjn/memory-scaffolding-shapes-llm-inference-how-persistent-context-changes-what-ai-builds-plj) - Dev.to article on persistent memory effects
-
----
-
-## Fallback Behavior
-
-`ram-coffers` is optimized for POWER8 4-socket S824 topology but degrades gracefully on single-NUMA or non-POWER8 platforms.
-
-### 1. Single-NUMA-Node Systems
-* **Memory Allocation:** On single-node Linux systems (or when `mbind` fails), coffer allocation (`ggml-ram-coffers.h:268-337`, `ggml-coffer-mmap.h:112-145`) falls back to node 0 or standard `mmap(MAP_PRIVATE | MAP_ANONYMOUS)`.
-* **Coffer Routing:** All coffer allocations route through single-node memory without throwing allocation or affinity errors.
-
-### 2. Non-POWER8 Architectures (x86_64, aarch64)
-* **Prefetch Pipeline (`dcbt`):** On non-PowerPC architectures (`ggml-ram-coffers.h:103-111`), `DCBT_PREFETCH`, `DCBT_STREAM_START`, and `DCBT_STREAM_STOP` expand to no-op expressions `(void)(addr)`.
-* **SIMD & Vector Operations:** Vector AltiVec/VSX acceleration in `dot_product` (`ggml-ram-coffers.h:204-222`) falls back to a clean scalar C loop when `__powerpc64__` / `__powerpc__` macros are not defined.
-* **Compatibility Layer:** `power8-compat.h:10-42` guards POWER8 specific vector load/store builtins (`vec_xl`, `vec_xst`, `vec_xl_len`).
-
-### 3. Compatibility Build Matrix
-
-| Architecture | Platform | NUMA Support | Prefetch (`dcbt`) | SIMD Acceleration |
-|---|---|---|---|---|
-| **POWER8 Multi-Node** | Linux (ppc64le) | Native 4-Node `mbind` | Native `dcbt` Streams | AltiVec / VSX |
-| **POWER8 Single-Node** | Linux (ppc64le) | Node 0 Fallback | Native `dcbt` Streams | AltiVec / VSX |
-| **x86_64** | Linux / macOS / Windows | Anonymous `mmap` Fallback | No-Op (`(void)`) | Scalar C Loop |
-| **aarch64 / Apple Silicon** | Linux / macOS | Anonymous `mmap` Fallback | No-Op (`(void)`) | Scalar C Loop |
 
 ---
 
