@@ -1,169 +1,153 @@
-# RAM Coffers: Fallback Behavior on Non-POWER8 / Single-NUMA Systems
+# Fallback Behavior on Non-POWER8 and Single-NUMA Systems
 
-This document describes how RAM Coffers behaves on systems different from the primary target (IBM POWER8 S824 with 4 NUMA nodes). It answers the question: "Will this build on my machine?"
+RAM Coffers is designed and benchmarked on an **IBM POWER8 S824** with four NUMA nodes. This document describes what happens when you build or run the code on less exotic hardware, so contributors can do a correctness smoke test before touching POWER8-specific paths.
 
-## Quick Reference: Build Matrix
+## Quick Summary
 
-| Platform | Compiles? | NUMA Routing | DCBT Prefetch | Vec_perm | Status |
-|----------|-----------|--------------|---------------|----------|--------|
-| POWER8 multi-node (S824) | ✅ Yes | ✅ Full 4-coffer routing | ✅ Hardware DCBT | ✅ Altivec vec_perm | **Primary target** |
-| POWER8 single-node | ✅ Yes | ⚠️ Single node only | ✅ Hardware DCBT | ✅ Altivec vec_perm | Functional, no multi-node benefit |
-| x86_64 | ✅ Yes | ⚠️ NUMA-aware (if available) | ❌ No-op (compiled out) | ❌ Scalar fallback | Functional, reduced performance |
-| aarch64 (ARM64) | ✅ Yes | ⚠️ NUMA-aware (if available) | ❌ No-op (compiled out) | ❌ Scalar fallback | Functional, reduced performance |
-| Apple Silicon | ✅ Yes | ❌ No NUMA API | ❌ No-op (compiled out) | ❌ Scalar fallback | Functional, NUMA hints skipped |
+| Platform | Build | NUMA routing | DCBT prefetch | Expected performance |
+|---|---|---|---|---|
+| POWER8 multi-node (S824) | ✅ native | ✅ full 4-node topology | ✅ `dcbt` assembly | 147 tok/s headline |
+| POWER8 single-node | ⚠️ compiles | ⚠️ degraded (hardcoded node 3) | ✅ `dcbt` assembly | Unknown / untested |
+| x86_64 Linux with libnuma | ✅ compiles | ⚠️ topology mismatch | ❌ no-op | CPU-bound, no NUMA benefit |
+| aarch64 Linux with libnuma | ✅ compiles | ⚠️ topology mismatch | ❌ no-op | CPU-bound, no NUMA benefit |
+| Any Linux without libnuma-dev | ❌ fails | — | — | Install `libnuma-dev` / `numactl-devel` first |
+| Non-Linux | ⚠️ may compile | ❌ skipped entirely (`#ifdef __linux__`) | ❌ skipped | Untested |
 
-## Single-NUMA-Node Systems
+## 1. Single-NUMA-Node Systems
 
-### What Happens
-
-When running on a system with only one NUMA node (or where NUMA is not available):
-
-1. **Initialization** (`coffer_init_numa()` — `ggml-ram-coffers.h`):
-   - `numa_available()` returns < 0 → prints `"Coffers: NUMA not available"` to stderr
-   - Returns -1, but `init_ram_coffers()` prints `"WARNING: Running without NUMA support"` and continues
-   - All 4 coffers are still initialized, but mapped to node 0
-
-2. **Memory Allocation** (`coffer_load_shard()` — `ggml-ram-coffers.h`):
-   - `set_mempolicy(MPOL_BIND, ...)` binds allocation to node 0
-   - `mmap()` still works — memory is allocated on the single available node
-   - No page migration occurs (nothing to migrate to)
-
-3. **Activation** (`activate_coffer_ex()` — `ggml-ram-coffers.h`):
-   - `numa_run_on_node(coffer->numa_node)` — on single-node systems, this binds to node 0 regardless of which coffer is activated
-   - Prefetch still works (DCBT is architecture-dependent, not NUMA-dependent)
-
-4. **Routing** (`route_to_coffer()` — `ggml-ram-coffers.h`):
-   - All 4 coffers are still loaded and routable
-   - Resonance routing still selects the best coffer based on query embedding
-   - **But**: all coffers share the same physical memory — no NUMA locality benefit
-
-5. **Page Migration** (`coffer_migrate_region()` — `ggml-coffer-mmap.h`):
-   - `numa_available()` returns < 0 → returns -1
-   - Pages stay where they were allocated (node 0)
-   - No error — migration is best-effort
-
-### Performance Impact
-
-- **No NUMA locality benefit**: All memory accesses go to the same node
-- **Still functional**: Routing, prefetch, and pruning all work correctly
-- **Expected performance**: Similar to standard llama.cpp with mmap
-
-## Non-POWER8 Architectures
-
-### POWER8-Specific Code
-
-The following code is POWER8-specific and has fallbacks:
-
-| Feature | Location | POWER8 Behavior | Non-POWER8 Fallback |
-|---------|----------|-----------------|---------------------|
-| **DCBT Prefetch** | `ggml-ram-coffers.h:127-132` | `dcbt` instruction for L2/L3 residency | No-op: `(void)(addr)` — compiled out |
-| **DCBT Stream** | `ggml-ram-coffers.h:128-129` | `dcbt 0,reg,stream_id` for streaming | No-op: `(void)(addr)` and `(void)0` |
-| **Vec_perm Attention** | `ggml-topk-collapse-vsx.h` | `vec_perm` for non-bijunctive collapse | Scalar fallback (not in these headers) |
-| **Dot Product** | `ggml-ram-coffers.h:191-204` | Altivec `vec_ld` + `vec_madd` SIMD | Scalar loop: `sum += a[d] * b[d]` |
-
-### Compilation Guards
-
-All POWER8-specific code is guarded by preprocessor macros:
+The routing tables in `ggml-ram-coffers.h` assume four nodes:
 
 ```c
+// ggml-ram-coffers.h:50-51
+static const int NUMA_TO_COFFER[4] = {2, 1, 3, 0};
+static const int COFFER_TO_NUMA[4] = {3, 1, 0, 2};
+```
+
+`coffer_init_numa()` only initializes as many coffers as the host reports nodes:
+
+```c
+// ggml-ram-coffers.h:274-279
+int n_nodes = numa_num_configured_nodes();
+for (int c = 0; c < MAX_COFFERS && c < n_nodes; c++) {
+    g_coffers[c].coffer_id = c;
+    g_coffers[c].numa_node = COFFER_TO_NUMA[c];
+    ...
+}
+```
+
+On a single-node machine, **only Coffer 0 is initialized**, and its `numa_node` is set to `COFFER_TO_NUMA[0] = 3` (the physical node that holds the heavy/general coffer on POWER8).
+
+Consequences:
+
+- `coffer_load_shard(0, ...)` calls `numa_run_on_node(3)` (`ggml-ram-coffers.h:296`). On a single-node host this binds the thread to a non-existent node; the kernel or libnuma may ignore it or return `EINVAL`.
+- `coffer_migrate_region()` checks `numa_available() < 0` and returns early only when NUMA is completely unavailable (`ggml-coffer-mmap.h:284-291`). If libnuma *is* present but only one node exists, `mbind()` is still attempted with node mask `1UL << 3`, which will likely fail because node 3 does not exist.
+- `activate_coffer()` still calls `numa_run_on_node(3)` (`ggml-ram-coffers.h:426`).
+
+In practice, on a single-node Linux box with libnuma installed, the code compiles and the non-NUMA code paths (mmap, file I/O, routing math) still run, but the NUMA placement calls are best-effort and may silently fail or print warnings depending on kernel/libnuma behavior.
+
+## 2. Non-POWER8 Architectures
+
+The only POWER8-specific instructions currently emitted are the **DCBT prefetch macros**:
+
+```c
+// ggml-ram-coffers.h:103-110
 #if defined(__powerpc64__) || defined(__powerpc__)
-    // POWER8-specific: DCBT, Altivec, vec_perm
+#define DCBT_PREFETCH(addr) __asm__ __volatile__("dcbt 0,%0" : : "r"(addr))
+...
 #else
-    // Fallback: no-ops, scalar code
+#define DCBT_PREFETCH(addr) (void)(addr)
+#define DCBT_STREAM_START(addr, id) (void)(addr)
+#define DCBT_STREAM_STOP(id) (void)0
 #endif
 ```
 
-**Result**: The code compiles on any architecture — POWER8 features are simply disabled on non-PowerPC systems.
+On x86_64, ARM64, or Apple Silicon, these macros compile to no-ops, so correctness is preserved but the cache-warming optimization is lost. The headline benchmark (147 tok/s) relies on DCBT + POWER8 cache line sizes and should be expected to collapse to standard CPU-bound throughput.
 
-### What Still Works on x86/ARM
+Other ISA-specific primitives mentioned in earlier write-ups (`mftb`, `vec_perm`) are **not present in the current headers**. The closest portable equivalent is the AES path in `ggml-vcipher-collapse.h`.
 
-- ✅ **Resonance routing**: Cosine similarity works on all architectures (scalar dot product)
-- ✅ **Coffer loading**: mmap works everywhere
-- ✅ **Layer-ahead prefetch**: The pipeline structure works, but prefetch is a no-op
-- ✅ **Non-bijunctive pruning**: The mask-based pruning logic is architecture-independent
-- ✅ **Neuromorphic routing**: Cognitive classification and routing work on all platforms
-- ✅ **Domain signatures**: All routing logic is pure C
+## 3. Build Requirements and Matrix
 
-### What's Missing on x86/ARM
+On Linux, `ggml-ram-coffers.h` and `ggml-coffer-mmap.h` unconditionally include `<numa.h>` and `<numaif.h>` inside `#ifdef __linux__` blocks:
 
-- ❌ **DCBT hardware prefetch**: No L2/L3 residency hints → higher cache miss rate
-- ❌ **Altivec SIMD**: Dot product uses scalar code → 4x slower (no vectorization)
-- ❌ **Vec_perm attention**: Non-bijunctive collapse uses scalar fallback
-- ❌ **NUMA locality**: Memory is allocated on default node, no interleave
-
-## Code References
-
-### ggml-ram-coffers.h
-
-- **Lines 127-132**: DCBT prefetch macros (POWER8-specific with fallback)
-- **Lines 135-146**: `dcbt_resident()` — prefetches entire region using DCBT
-- **Lines 191-204**: `dot_product()` — Altivec SIMD with scalar fallback
-- **Lines 210-215**: `coffer_init_numa()` — NUMA initialization with graceful degradation
-- **Lines 283-295**: `activate_coffer_ex()` — NUMA binding with fallback
-
-### ggml-coffer-mmap.h
-
-- **Lines 13-15**: NUMA includes (guarded by `__linux__`)
-- **Lines 167-195**: `coffer_migrate_region()` — page migration with NUMA fallback
-- **Lines 237-250**: `coffer_apply_numa_hints()` — NUMA placement with availability check
-- **Lines 263-290**: `coffer_prefetch_layer_weights()` — DCBT prefetch (POWER8 only)
-
-### ggml-neuromorphic-coffers.h
-
-- **Lines 1-100**: Cognitive classification — pure C, architecture-independent
-- **Lines 100-200**: Routing logic — no architecture-specific code
-- **Lines 200-300**: Sensor integration — pure C, architecture-independent
-
-## Recommendations
-
-### For x86_64 Users
-
-1. **It will compile and run** — all features degrade gracefully
-2. **Performance will be lower** — expect ~50-70% of POWER8 throughput due to:
-   - No DCBT prefetch (cache misses increase)
-   - Scalar dot product (no SIMD)
-3. **Consider using llama.cpp directly** — RAM Coffers' advantage is primarily on POWER8
-4. **Testing is welcome** — run `tests/test_coffers.py` to verify functionality
-
-### For Apple Silicon Users
-
-1. **It will compile and run** — macOS has no NUMA API, so NUMA features are skipped
-2. **Apple Silicon has its own advantages** — unified memory architecture makes NUMA less relevant
-3. **No DCBT** — Apple Silicon uses different prefetch mechanisms
-4. **Consider Metal acceleration** — RAM Coffers doesn't use GPU; llama.cpp with Metal is faster
-
-### For POWER8 Single-Node Users
-
-1. **Full functionality** — all POWER8 features (DCBT, Altivec) work
-2. **No multi-node benefit** — all coffers share one node
-3. **Still faster than stock llama.cpp** — DCBT prefetch and vec_perm attention help
-4. **Test with**: `./benchmark_coffers_vs_llamacpp.sh` to measure improvement
-
-## Testing
-
-Run the test suite to verify your platform:
-
-```bash
-# Basic functionality test
-python3 tests/test_coffers.py
-
-# Benchmark comparison
-./benchmark_coffers_vs_llamacpp.sh
-
-# Check NUMA topology (Linux)
-numactl --hardware
-
-# Check compilation flags
-gcc -dM -E - < /dev/null | grep -E "__powerpc__|__x86_64__|__aarch64__"
+```c
+// ggml-ram-coffers.h:35-37
+#ifdef __linux__
+#include <numa.h>
+#include <numaif.h>
+#include <sched.h>
+#endif
 ```
 
-## Summary
+Therefore:
 
-RAM Coffers is designed to degrade gracefully:
+| OS / toolchain | Needs libnuma headers | Expected result |
+|---|---|---|
+| Debian/Ubuntu x86_64 | `sudo apt install libnuma-dev` | Compiles; DCBT no-op |
+| Fedora/RHEL x86_64 | `sudo dnf install numactl-devel` | Compiles; DCBT no-op |
+| Debian/Ubuntu aarch64 | `sudo apt install libnuma-dev` | Compiles; DCBT no-op |
+| macOS | N/A (not `__linux__`) | NUMA code skipped; untested |
+| Windows MSVC/MinGW | N/A (not `__linux__`) | NUMA code skipped; untested |
 
-- **POWER8 multi-node**: Full functionality, maximum performance
-- **POWER8 single-node**: Full functionality, reduced NUMA benefit
-- **x86_64 / ARM64**: Functional, but loses hardware prefetch and SIMD advantages
-- **Apple Silicon**: Functional, but no NUMA or DCBT features
+## 4. Minimum Smoke Test for Correctness
 
-The core routing and pruning logic is architecture-independent C code. POWER8-specific features (DCBT, Altivec, vec_perm) are optional optimizations that are compiled out on other platforms.
+There is no dedicated standalone test harness in this repo, but you can verify that the headers compile and the routing tables are initialized with a tiny C program:
+
+```c
+// smoke_test.c
+#define VITE_TELEMETRY_ENDPOINT ""
+#include "ggml-ram-coffers.h"
+#include <stdio.h>
+
+int main(void) {
+    printf("MAX_COFFERS = %d\n", MAX_COFFERS);
+    printf("NUMA_TO_COFFER[0..3] = %d %d %d %d\n",
+           NUMA_TO_COFFER[0], NUMA_TO_COFFER[1],
+           NUMA_TO_COFFER[2], NUMA_TO_COFFER[3]);
+    printf("COFFER_TO_NUMA[0..3] = %d %d %d %d\n",
+           COFFER_TO_NUMA[0], COFFER_TO_NUMA[1],
+           COFFER_TO_NUMA[2], COFFER_TO_NUMA[3]);
+    return 0;
+}
+```
+
+Build and run on a non-POWER8 Linux box:
+
+```bash
+gcc -I. smoke_test.c -o smoke_test -lnuma
+./smoke_test
+```
+
+Expected output:
+
+```text
+MAX_COFFERS = 4
+NUMA_TO_COFFER[0..3] = 2 1 3 0
+COFFER_TO_NUMA[0..3] = 3 1 0 2
+```
+
+This proves the header compiles and the routing tables are loaded, but it does **not** exercise mmap, NUMA placement, or DCBT acceleration.
+
+## 5. Detecting Degraded Mode at Startup
+
+A runtime health check can be added around `coffer_init_numa()`:
+
+1. Call `numa_num_configured_nodes()`.
+2. If `n_nodes < 4`, log a warning: "POWER8 S824 4-node topology not detected; NUMA placement will be degraded."
+3. If `n_nodes == 1`, additionally warn: "Single-node host detected; numa_run_on_node/mbind may target non-existent nodes."
+4. Check `__powerpc64__` / `__powerpc__` at compile time; if undefined, warn that DCBT prefetch is disabled.
+
+Currently the repo does not emit these warnings automatically; contributors adding a startup probe should place it immediately after `coffer_init_numa()`.
+
+## 6. What Is NOT Expected to Work
+
+- **Performance parity**: x86_64/ARM64 smoke tests validate correctness only; the POWER8-specific throughput numbers will not reproduce.
+- **4-coffer load on single-node**: Only Coffer 0 is initialized; attempts to load Coffer 1-3 will access uninitialized state.
+- **NUMA page migration on mismatched topology**: `mbind()` with node masks based on the POWER8 table is not portable.
+
+## 7. Recommended Contributor Path
+
+1. Build on your local machine (install `libnuma-dev` on Linux).
+2. Run the `smoke_test.c` snippet above to confirm header compilation.
+3. Make changes inside `#if defined(__powerpc64__) || defined(__powerpc__)` blocks when adding POWER8-only optimizations.
+4. Keep non-POWER8 paths as no-ops or scalar fallbacks so smoke tests continue to compile and run.
+5. Benchmark on POWER8 S824 hardware before claiming performance improvements.
