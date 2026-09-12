@@ -135,6 +135,38 @@ node distances:
     self.assertEqual(plan["model_size_mb"], None)
     self.assertIn("model path not found", plan["fallback_reason"])
 
+  def test_parse_sysfs_numa_handles_memory_only_nodes_with_empty_or_whitespace_cpulist(self):
+    # Tests memory-only NUMA nodes (e.g. CXL / PMEM without attached CPUs)
+    # where cpulist is empty or contains only whitespace/newline.
+    with tempfile.TemporaryDirectory() as base:
+      layout = {
+        0: {"cpulist": "0-3", "MemTotal": 1048576, "MemFree": 524288},
+        1: {"cpulist": "\n", "MemTotal": 3145728, "MemFree": 1572864},
+        2: {"cpulist": "", "MemTotal": 2097152, "MemFree": 1048576},
+      }
+      for node_id, spec in layout.items():
+        node_path = os.path.join(base, f"node{node_id}")
+        os.makedirs(node_path)
+        with open(os.path.join(node_path, "cpulist"), "w") as f:
+          f.write(spec["cpulist"])
+        with open(os.path.join(node_path, "meminfo"), "w") as f:
+          f.write(f"Node {node_id} MemTotal:       {spec['MemTotal']} kB\n")
+          f.write(f"Node {node_id} MemFree:        {spec['MemFree']} kB\n")
+
+      topology = _parse_sysfs_numa(base)
+
+    self.assertEqual(topology["num_nodes"], 3)
+    self.assertEqual(topology["nodes"][0]["cpus"], [0, 1, 2, 3])
+    self.assertEqual(topology["nodes"][0]["size_mb"], 1024)
+    # Node 1: newline-only cpulist
+    self.assertEqual(topology["nodes"][1]["cpus"], [])
+    self.assertEqual(topology["nodes"][1]["size_mb"], 3072)
+    self.assertEqual(topology["nodes"][1]["free_mb"], 1536)
+    # Node 2: empty string cpulist
+    self.assertEqual(topology["nodes"][2]["cpus"], [])
+    self.assertEqual(topology["nodes"][2]["size_mb"], 2048)
+    self.assertEqual(topology["nodes"][2]["free_mb"], 1024)
+
 
 if __name__ == "__main__":
   unittest.main()
