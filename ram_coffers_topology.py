@@ -103,7 +103,8 @@ def _parse_sysfs_numa(node_dir: str = '/sys/devices/system/node') -> Optional[Di
             with open(cpulist_path, 'r') as f:
                 cpu_str = f.read().strip()
                 cpus = []
-                for part in cpu_str.split(','):
+                # Memory-only NUMA nodes have an empty CPU list.
+                for part in (cpu_str.split(',') if cpu_str else []):
                     if '-' in part:
                         start, end = part.split('-')
                         cpus.extend(range(int(start), int(end) + 1))
