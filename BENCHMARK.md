@@ -261,6 +261,67 @@ report should include:
 This keeps performance claims falsifiable, and it's exactly what let this
 document distinguish "measured" from "template" in the first place.
 
+## Automated Topology & Benchmark Preflight (scripts/topology_preflight.py)
+
+To simplify reporting and eliminate manual guesswork when assessing whether a host has the expected NUMA topology, POWER8/VSX/crypto ISA support, and build configuration, use the read-only preflight utility:
+
+```bash
+# Human-readable preflight report
+python3 scripts/topology_preflight.py
+
+# Machine-readable JSON output for automated benchmarks & bug reports
+python3 scripts/topology_preflight.py --json
+```
+
+### Sample Output (`--json`)
+```json
+{
+  "preflight_version": "1.0.0",
+  "architecture": {
+    "machine": "ppc64le",
+    "system": "linux",
+    "is_powerpc": true,
+    "python_version": "3.10.12"
+  },
+  "cpu_info": {
+    "model": "POWER8 (architected), altivec supported",
+    "cores": 16,
+    "threads_per_core": 8,
+    "isa_flags": ["altivec", "vsx", "vcipher", "vshasigma"],
+    "has_altivec": true,
+    "has_vsx": true,
+    "has_crypto": true
+  },
+  "numa_topology": {
+    "num_nodes": 4,
+    "nodes": [
+      {"node_id": 0, "cpus": [0, 1, 2, 3], "cpu_count": 4, "size_mb": 131072, "free_mb": 98304},
+      {"node_id": 1, "cpus": [4, 5, 6, 7], "cpu_count": 4, "size_mb": 131072, "free_mb": 98304},
+      {"node_id": 2, "cpus": [8, 9, 10, 11], "cpu_count": 4, "size_mb": 131072, "free_mb": 98304},
+      {"node_id": 3, "cpus": [12, 13, 14, 15], "cpu_count": 4, "size_mb": 131072, "free_mb": 98304}
+    ]
+  },
+  "compiler_flags": {
+    "power8_release": "-mcpu=power8 -mvsx -maltivec -O3 -funroll-loops",
+    "power8_mass": "-DGGML_USE_MASS=1 -I/opt/ibm/mass/include -L/opt/ibm/mass/lib -lmassvp8 -lmass",
+    "power9_compat": "-mcpu=power8 -mvsx -maltivec -O3 (uses power8-compat.h shim)",
+    "x86_64_fallback": "-mavx2 -mfma -O3",
+    "apple_silicon": "-mcpu=apple-m1 -O3"
+  },
+  "verdict": {
+    "status": "OPTIMAL",
+    "benchmark_mode": "native_power8_4coffer",
+    "can_reproduce_canonical_147_ts": true,
+    "summary": "Host meets all prerequisites for reproducing canonical 147.54 t/s benchmarks (POWER8/POWER9 with AltiVec/VSX and >= 4 NUMA nodes).",
+    "recommendations": [
+      "Compile with: -mcpu=power8 -mvsx -maltivec -O3 -funroll-loops",
+      "Ensure 64 threads optimal configuration is selected (-t 64)",
+      "Run benchmark_coffers_vs_llamacpp.sh or benchmark_harness.sh"
+    ]
+  }
+}
+```
+
 ## Related issues and PRs
 
 - #667 / #662: requests for a reproducible benchmark recipe (this file)
@@ -269,3 +330,4 @@ document distinguish "measured" from "template" in the first place.
 - #669, #671: README-level reproduction guidance, both merged, and this file
   is now the canonical detail doc they point to
 - #670: the `--plan` dry-run implementation for #668
+- #705: machine-readable topology/benchmark preflight (`scripts/topology_preflight.py --json`)
