@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -87,27 +88,6 @@ typedef struct {
     /* NUMA placement stats */
     size_t bytes_per_node[4];
 } coffer_mmap_ctx_t;
-
-/*===========================================================================
- * GGUF String Reader (length-prefixed)
- *===========================================================================*/
-
-static inline uint64_t read_u64(const void* ptr) {
-    return *(const uint64_t*)ptr;
-}
-
-static inline uint32_t read_u32(const void* ptr) {
-    return *(const uint32_t*)ptr;
-}
-
-/* Read GGUF string, returns bytes consumed */
-static inline int read_gguf_string(const void* ptr, char* out, size_t out_size) {
-    uint64_t len = read_u64(ptr);
-    if (len >= out_size) len = out_size - 1;
-    memcpy(out, (const char*)ptr + 8, len);
-    out[len] = '\0';
-    return 8 + (len > 0 ? ((len + 31) & ~31) : 0);  /* Aligned */
-}
 
 /*===========================================================================
  * Layer ID Extraction from Tensor Name
@@ -185,16 +165,158 @@ static int assign_numa_node(int layer_id, int total_layers, const char* tensor_n
  * GGUF Minimal Parser - Extract Tensor Locations
  *===========================================================================*/
 
+static int gguf_read_bytes(
+    const coffer_mmap_ctx_t* ctx,
+    size_t* pos,
+    void* out,
+    size_t size
+) {
+    if (*pos > ctx->file_size || size > ctx->file_size - *pos) {
+        return -1;
+    }
+    if (out && size > 0) {
+        memcpy(out, (const uint8_t*)ctx->mapped_addr + *pos, size);
+    }
+    *pos += size;
+    return 0;
+}
+
+static int gguf_read_u32_checked(
+    const coffer_mmap_ctx_t* ctx,
+    size_t* pos,
+    uint32_t* value
+) {
+    return gguf_read_bytes(ctx, pos, value, sizeof(*value));
+}
+
+static int gguf_read_u64_checked(
+    const coffer_mmap_ctx_t* ctx,
+    size_t* pos,
+    uint64_t* value
+) {
+    return gguf_read_bytes(ctx, pos, value, sizeof(*value));
+}
+
+static int gguf_read_string_checked(
+    const coffer_mmap_ctx_t* ctx,
+    size_t* pos,
+    char* out,
+    size_t out_size
+) {
+    uint64_t raw_len = 0;
+    if (gguf_read_u64_checked(ctx, pos, &raw_len) < 0) {
+        return -1;
+    }
+    if (*pos > ctx->file_size || raw_len > ctx->file_size - *pos) {
+        return -1;
+    }
+
+    size_t len = (size_t)raw_len;
+    if ((uint64_t)len != raw_len) {
+        return -1;
+    }
+    if (out && out_size > 0) {
+        size_t copy_len = len < out_size - 1 ? len : out_size - 1;
+        if (copy_len > 0) {
+            memcpy(out, (const uint8_t*)ctx->mapped_addr + *pos, copy_len);
+        }
+        out[copy_len] = '\0';
+    }
+    *pos += len;
+    return 0;
+}
+
+static size_t gguf_scalar_size(uint32_t type) {
+    switch (type) {
+        case GGUF_TYPE_UINT8:
+        case GGUF_TYPE_INT8:
+        case GGUF_TYPE_BOOL:
+            return 1;
+        case GGUF_TYPE_UINT16:
+        case GGUF_TYPE_INT16:
+            return 2;
+        case GGUF_TYPE_UINT32:
+        case GGUF_TYPE_INT32:
+        case GGUF_TYPE_FLOAT32:
+            return 4;
+        case GGUF_TYPE_UINT64:
+        case GGUF_TYPE_INT64:
+        case GGUF_TYPE_FLOAT64:
+            return 8;
+        default:
+            return 0;
+    }
+}
+
+static int gguf_skip_value(
+    const coffer_mmap_ctx_t* ctx,
+    size_t* pos,
+    uint32_t type
+) {
+    if (type == GGUF_TYPE_STRING) {
+        return gguf_read_string_checked(ctx, pos, NULL, 0);
+    }
+
+    if (type == GGUF_TYPE_ARRAY) {
+        uint32_t element_type = 0;
+        uint64_t raw_count = 0;
+        if (gguf_read_u32_checked(ctx, pos, &element_type) < 0 ||
+            gguf_read_u64_checked(ctx, pos, &raw_count) < 0) {
+            return -1;
+        }
+        if (element_type == GGUF_TYPE_ARRAY) {
+            return -1;
+        }
+
+        size_t count = (size_t)raw_count;
+        if ((uint64_t)count != raw_count) {
+            return -1;
+        }
+        if (element_type == GGUF_TYPE_STRING) {
+            for (size_t i = 0; i < count; i++) {
+                if (gguf_read_string_checked(ctx, pos, NULL, 0) < 0) {
+                    return -1;
+                }
+            }
+            return 0;
+        }
+
+        size_t element_size = gguf_scalar_size(element_type);
+        if (element_size == 0 || count > SIZE_MAX / element_size) {
+            return -1;
+        }
+        return gguf_read_bytes(ctx, pos, NULL, count * element_size);
+    }
+
+    size_t scalar_size = gguf_scalar_size(type);
+    if (scalar_size == 0) {
+        return -1;
+    }
+    return gguf_read_bytes(ctx, pos, NULL, scalar_size);
+}
+
 static int coffer_parse_gguf(coffer_mmap_ctx_t* ctx) {
-    const uint8_t* data = (const uint8_t*)ctx->mapped_addr;
     size_t pos = 0;
+    uint32_t alignment = 32;
 
-    /* Read header */
-    memcpy(&ctx->header, data, sizeof(gguf_header_t));
-    pos += sizeof(gguf_header_t);
+    if (!ctx || !ctx->mapped_addr || ctx->file_size < sizeof(gguf_header_t)) {
+        return -1;
+    }
 
+    if (gguf_read_bytes(ctx, &pos, &ctx->header, sizeof(ctx->header)) < 0) {
+        return -1;
+    }
     if (ctx->header.magic != GGUF_MAGIC) {
         fprintf(stderr, "Coffer: Invalid GGUF magic (got 0x%08X)\n", ctx->header.magic);
+        return -1;
+    }
+    if (ctx->header.version < 2 || ctx->header.version > 3) {
+        fprintf(stderr, "Coffer: Unsupported GGUF version %u\n", ctx->header.version);
+        return -1;
+    }
+    if (ctx->header.n_tensors > INT_MAX ||
+        ctx->header.n_tensors > SIZE_MAX / sizeof(coffer_tensor_info_t)) {
+        fprintf(stderr, "Coffer: Too many tensors in GGUF\n");
         return -1;
     }
 
@@ -203,24 +325,115 @@ static int coffer_parse_gguf(coffer_mmap_ctx_t* ctx) {
             (unsigned long)ctx->header.n_tensors,
             (unsigned long)ctx->header.n_kv);
 
-    /* Skip KV pairs (complex parsing, we just need tensor locations) */
-    /* For now, use a heuristic: scan for tensor names pattern */
+    for (uint64_t i = 0; i < ctx->header.n_kv; i++) {
+        char key[128];
+        uint32_t type = 0;
+        if (gguf_read_string_checked(ctx, &pos, key, sizeof(key)) < 0 ||
+            gguf_read_u32_checked(ctx, &pos, &type) < 0) {
+            goto parse_error;
+        }
 
-    /* Allocate tensor info array */
-    ctx->n_tensors = ctx->header.n_tensors;
-    ctx->tensors = (coffer_tensor_info_t*)calloc(ctx->n_tensors, sizeof(coffer_tensor_info_t));
-    if (!ctx->tensors) {
-        return -1;
+        if (strcmp(key, "general.alignment") == 0 && type == GGUF_TYPE_UINT32) {
+            uint32_t parsed_alignment = 0;
+            if (gguf_read_u32_checked(ctx, &pos, &parsed_alignment) < 0 ||
+                parsed_alignment == 0) {
+                goto parse_error;
+            }
+            alignment = parsed_alignment;
+        } else if (gguf_skip_value(ctx, &pos, type) < 0) {
+            goto parse_error;
+        }
     }
 
-    /* Find tensor data offset by scanning for alignment */
-    /* Tensor data typically starts at 256-byte boundary after metadata */
+    ctx->n_tensors = (int)ctx->header.n_tensors;
+    if (ctx->n_tensors > 0) {
+        ctx->tensors = (coffer_tensor_info_t*)calloc(
+            (size_t)ctx->n_tensors,
+            sizeof(coffer_tensor_info_t)
+        );
+        if (!ctx->tensors) {
+            goto parse_error;
+        }
+    }
 
-    /* Simplified: assume tensor data starts after ~10% of file (metadata) */
-    /* Real implementation would parse KV and tensor info properly */
-    ctx->tensor_data_offset = 0;  /* Will be set during load */
+    for (int i = 0; i < ctx->n_tensors; i++) {
+        coffer_tensor_info_t* tensor = &ctx->tensors[i];
+        uint32_t n_dims = 0;
+        uint32_t ggml_type = 0;
+
+        if (gguf_read_string_checked(ctx, &pos, tensor->name, sizeof(tensor->name)) < 0 ||
+            gguf_read_u32_checked(ctx, &pos, &n_dims) < 0 ||
+            n_dims == 0 || n_dims > 4) {
+            goto parse_error;
+        }
+
+        tensor->n_dims = (int)n_dims;
+        for (uint32_t dim = 0; dim < n_dims; dim++) {
+            if (gguf_read_u64_checked(ctx, &pos, &tensor->dims[dim]) < 0 ||
+                tensor->dims[dim] == 0) {
+                goto parse_error;
+            }
+        }
+        if (gguf_read_u32_checked(ctx, &pos, &ggml_type) < 0 ||
+            gguf_read_u64_checked(ctx, &pos, &tensor->offset) < 0) {
+            goto parse_error;
+        }
+        tensor->ggml_type = (int)ggml_type;
+        tensor->layer_id = extract_layer_id(tensor->name);
+    }
+
+    {
+        size_t remainder = pos % alignment;
+        size_t padding = remainder == 0 ? 0 : alignment - remainder;
+        if (padding > ctx->file_size - pos) {
+            goto parse_error;
+        }
+        pos += padding;
+    }
+    ctx->tensor_data_offset = (uint64_t)pos;
+
+    if (ctx->tensor_data_offset > ctx->file_size) {
+        goto parse_error;
+    }
+
+    size_t tensor_data_size = ctx->file_size - (size_t)ctx->tensor_data_offset;
+    for (int i = 0; i < ctx->n_tensors; i++) {
+        coffer_tensor_info_t* tensor = &ctx->tensors[i];
+        if (tensor->offset > tensor_data_size) {
+            goto parse_error;
+        }
+
+        /* Use the file span to the next tensor rather than a GGML type table.
+         * This remains correct for placement and supports new quantization types. */
+        uint64_t next_offset = tensor_data_size;
+        for (int j = 0; j < ctx->n_tensors; j++) {
+            uint64_t candidate = ctx->tensors[j].offset;
+            if (candidate > tensor->offset && candidate < next_offset) {
+                next_offset = candidate;
+            }
+        }
+        if (next_offset < tensor->offset) {
+            goto parse_error;
+        }
+        uint64_t span = next_offset - tensor->offset;
+        if ((uint64_t)(size_t)span != span) {
+            goto parse_error;
+        }
+        tensor->size_bytes = span;
+        if (tensor->size_bytes == 0) {
+            goto parse_error;
+        }
+    }
 
     return 0;
+
+parse_error:
+    fprintf(stderr, "Coffer: Malformed or truncated GGUF metadata\n");
+    free(ctx->tensors);
+    ctx->tensors = NULL;
+    ctx->n_tensors = 0;
+    ctx->tensor_data_offset = 0;
+    return -1;
 }
 
 /*===========================================================================
@@ -325,8 +538,8 @@ static int coffer_place_tensors(coffer_mmap_ctx_t* ctx, int total_layers) {
     for (int i = 0; i < ctx->n_tensors; i++) {
         coffer_tensor_info_t* t = &ctx->tensors[i];
 
-        /* Skip if no valid offset */
-        if (t->offset == 0 || t->size_bytes == 0) continue;
+        /* Offset 0 is valid for the first tensor; size is the validity check. */
+        if (t->size_bytes == 0) continue;
 
         /* Determine target node */
         t->layer_id = extract_layer_id(t->name);
