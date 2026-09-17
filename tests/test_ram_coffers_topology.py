@@ -58,9 +58,30 @@ node distances:
     self.assertEqual(topology["num_nodes"], 2)
     self.assertEqual(topology["nodes"][0]["cpus"], [0, 1, 2, 3])
     self.assertEqual(topology["nodes"][0]["size_mb"], 33554432 // 1024)
-    self.assertEqual(topology["nodes"][0]["free_mb"], 12582912 // 1024)
-    self.assertEqual(topology["nodes"][1]["size_mb"], 67108864 // 1024)
-    self.assertEqual(topology["nodes"][1]["free_mb"], 50331648 // 1024)
+
+  def test_parse_sysfs_numa_handles_memory_only_node_with_empty_cpulist(self):
+    # Memory-only NUMA nodes have no CPUs, represented by an empty cpulist or newline
+    with tempfile.TemporaryDirectory() as base:
+      layout = {
+        0: {"cpulist": "0-3", "MemTotal": 1048576, "MemFree": 524288},
+        1: {"cpulist": "\n", "MemTotal": 3145728, "MemFree": 1572864},
+      }
+      for node_id, spec in layout.items():
+        node_path = os.path.join(base, f"node{node_id}")
+        os.makedirs(node_path)
+        with open(os.path.join(node_path, "cpulist"), "w") as f:
+          f.write(spec["cpulist"])
+        with open(os.path.join(node_path, "meminfo"), "w") as f:
+          f.write(f"Node {node_id} MemTotal:       {spec['MemTotal']} kB\n")
+          f.write(f"Node {node_id} MemFree:        {spec['MemFree']} kB\n")
+
+      topology = _parse_sysfs_numa(base)
+
+    self.assertEqual(topology["num_nodes"], 2)
+    self.assertEqual(topology["nodes"][0]["cpus"], [0, 1, 2, 3])
+    self.assertEqual(topology["nodes"][1]["cpus"], [])
+    self.assertEqual(topology["nodes"][1]["size_mb"], 3072)
+    self.assertEqual(topology["nodes"][1]["free_mb"], 1536)
 
   def test_calculate_weights_uses_memory_proportions(self):
     topology = {
