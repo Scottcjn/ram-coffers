@@ -14,7 +14,8 @@ See **[BENCHMARK.md](BENCHMARK.md)** for exactly what was measured, what's still
 **Author:** Scott Boudreaux
 **Date:** December 16, 2025
 **Institution:** Elyan Labs (Independent Research)
-**Hardware:** IBM POWER8 S824 (320GB RAM, Dual 8-core)
+**Hardware:** IBM POWER8 S824, dual 8-core POWER8 (16 cores, SMT8 = 128 threads), CPU-only.
+RAM and NUMA layout changed between passes — see [Benchmark hardware: two configurations](#benchmark-hardware-two-configurations).
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18321905.svg)](https://doi.org/10.5281/zenodo.18321905)
 
@@ -44,15 +45,52 @@ Key innovations include:
 
 4. **DCBT Resident Prefetch**: PowerPC data cache block touch hints for L2/L3 residency, achieving 147+ tokens/second on POWER8
 
+## Benchmark hardware: two configurations
+
+The same physical machine was benchmarked before and after a memory upgrade, and
+earlier revisions of this README quoted figures from both without saying which was
+which. That is what produced the apparent contradiction between a "320 GB" machine
+and an architecture table summing to 557 GB. Both are real; they are different
+passes.
+
+| | Pass 1 — original | Pass 2 — after the upgrade |
+|---|---|---|
+| NUMA nodes | **2** | **4** |
+| Per node | node0 128 GB (CPUs 0-31), node1 192 GB (CPUs 32-63) | see the coffer table below |
+| Sum of nodes | **320 GB** | **557 GB** addressable |
+| Free when measured | — | 524 GB |
+| Also quoted as | "320GB RAM" (byline, paper) | "512 GB" (active), "768 GB" (installed) |
+| Recorded | lab topology note, 2025-01-17 | the 4-coffer architecture below |
+
+Both machines are the same IBM POWER8 S824: dual 8-core POWER8, 16 cores, SMT8 =
+128 hardware threads, CPU-only inference. **Only the memory configuration and the
+resulting NUMA node count changed.** The published paper
+([10.5281/zenodo.18321905](https://doi.org/10.5281/zenodo.18321905), Dec 2025)
+describes Pass 1 and has not been retrofitted — its 320 GB figure is correct for
+the hardware it was written against.
+
+Where "512 GB" and "768 GB" appear elsewhere in this README, they are the active
+and installed totals for Pass 2. They do not equal the 557 GB sum of per-node
+capacities, and reconciling *that* gap (LPAR active memory vs what each node
+reports) still needs a live check. **The box is offline at the time of writing, so
+this section is reconstructed from Elyan Labs' own dated records, not from a fresh
+`numactl --hardware` run.** If you are reproducing any of this, capture your own
+topology and report that, rather than quoting a number from this table — see
+[BENCHMARK.md](BENCHMARK.md).
+
 ## Architecture
 
+Pass 2 configuration. Capacity is the node's total; the free column is what was
+available when the coffer benchmark ran.
+
 ```
-| Coffer | NUMA Node | Capacity | Role                |
-|--------|-----------|----------|---------------------|
-| 0      | 3         | 193 GB   | Heavy/General (core)|
-| 1      | 1         | 183 GB   | Science/Tech domain |
-| 2      | 0         | 119 GB   | Creative/Long CTX   |
-| 3      | 2         | 62 GB    | Niche/History       |
+| Coffer | NUMA Node | Capacity | Free   | Role                |
+|--------|-----------|----------|--------|---------------------|
+| 0      | 3         | 193 GB   | 189 GB | Heavy/General (core)|
+| 1      | 1         | 183 GB   | 178 GB | Science/Tech domain |
+| 2      | 0         | 119 GB   | 114 GB | Creative/Long CTX   |
+| 3      | 2         | 62 GB    |  43 GB | Niche/History       |
+|        |           | 557 GB   | 524 GB |                     |
 ```
 
 ## Processing Flow
