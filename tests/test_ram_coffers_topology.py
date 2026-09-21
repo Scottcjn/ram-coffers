@@ -3,10 +3,12 @@ import tempfile
 import unittest
 
 from ram_coffers_topology import (
+  _format_cpuset,
   _parse_numactl_output,
   _parse_sysfs_numa,
   build_placement_plan,
   calculate_weights,
+  display_topology_text,
 )
 
 
@@ -134,6 +136,14 @@ node distances:
     self.assertEqual(plan["model_path"], "missing.gguf")
     self.assertEqual(plan["model_size_mb"], None)
     self.assertIn("model path not found", plan["fallback_reason"])
+
+  def test_format_cpuset_collapses_contiguous_runs_and_preserves_gaps(self):
+    self.assertEqual(_format_cpuset([]), "N/A")
+    self.assertEqual(_format_cpuset([0]), "0")
+    self.assertEqual(_format_cpuset([0, 1, 2, 3]), "0-3")
+    self.assertEqual(_format_cpuset([0, 2, 4, 6]), "0,2,4,6")
+    self.assertEqual(_format_cpuset([0, 1, 2, 4, 5, 8]), "0-2,4-5,8")
+    self.assertEqual(_format_cpuset([7, 2, 0, 1, 6]), "0-2,6-7")
 
 
 if __name__ == "__main__":

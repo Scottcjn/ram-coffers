@@ -256,6 +256,31 @@ def build_placement_plan(
     }
 
 
+def _format_cpuset(cpus: List[int]) -> str:
+    """Format a list of CPU IDs collapsing contiguous adjacent runs (e.g. [0,1,2,4,5] -> '0-2,4-5', [0,2,4,6] -> '0,2,4,6')."""
+    if not cpus:
+        return "N/A"
+    sorted_cpus = sorted(set(cpus))
+    ranges = []
+    start = sorted_cpus[0]
+    end = start
+    for c in sorted_cpus[1:]:
+        if c == end + 1:
+            end = c
+        else:
+            if start == end:
+                ranges.append(str(start))
+            else:
+                ranges.append(f"{start}-{end}")
+            start = c
+            end = c
+    if start == end:
+        ranges.append(str(start))
+    else:
+        ranges.append(f"{start}-{end}")
+    return ",".join(ranges)
+
+
 def display_topology_text(topology: Dict, weights: Dict[int, float]) -> None:
     """Display NUMA topology as text tree."""
     print(f"\n{'='*60}")
@@ -270,7 +295,7 @@ def display_topology_text(topology: Dict, weights: Dict[int, float]) -> None:
         prefix = "└──" if is_last else "├──"
         
         cpus = info.get('cpus', [])
-        cpu_str = f"{cpus[0]}-{cpus[-1]}" if cpus else "N/A"
+        cpu_str = _format_cpuset(cpus)
         memory_gb = info.get('size_mb', 0) / 1024
         weight = weights.get(node_id, 0)
         
