@@ -39,6 +39,10 @@
 #define GEN9_FP8_BLOCK 128
 #define GEN9_WAVE 32            /* RDNA wave32 */
 
+/* E4M3FN -> float. Must agree with kernels/fp8.c and gen9_cluster/fp8.py on
+ * every code, including the two NaNs (0x7F/0xFF); the CPU decoders are the
+ * reference and tests/test_gpu_decoder_parity.py checks this body against
+ * them over all 256 codes. */
 __device__ __forceinline__ float decode_e4m3(unsigned int b)
 {
     const unsigned int sign = (b >> 7) & 0x1u;
@@ -47,6 +51,8 @@ __device__ __forceinline__ float decode_e4m3(unsigned int b)
     float mag;
     if (exp == 0u) {
         mag = float(mant) * 0.125f * exp2f(-6.0f);
+    } else if (exp == 0xFu && mant == 0x7u) {
+        return __uint_as_float(0x7FC00000u);   /* NaN, same as the CPU */
     } else {
         mag = (1.0f + float(mant) * 0.125f) * exp2f(float(exp) - 7.0f);
     }
