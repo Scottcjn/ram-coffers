@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -7,10 +9,99 @@ from ram_coffers_topology import (
   _parse_sysfs_numa,
   build_placement_plan,
   calculate_weights,
+  display_topology_text,
+  format_cpu_list,
+  parse_cpu_list,
 )
 
 
+class TestParseCpuList(unittest.TestCase):
+  def test_single_cpu(self):
+    self.assertEqual(parse_cpu_list("5"), [5])
+
+  def test_single_range(self):
+    self.assertEqual(parse_cpu_list("0-31"), list(range(32)))
+
+  def test_mixed_ranges_and_singles_comma_separated(self):
+    # sysfs cpulist spelling; the old parser split "0-31,64-95" on "-" and
+    # got three pieces, so a POWER8 SMT node raised ValueError.
+    self.assertEqual(parse_cpu_list("0-31,64-95"),
+                     list(range(0, 32)) + list(range(64, 96)))
+    self.assertEqual(parse_cpu_list("0-3,8,9"), [0, 1, 2, 3, 8, 9])
+
+  def test_mixed_space_separated_numactl_spelling(self):
+    self.assertEqual(parse_cpu_list("0-3 8 9"), [0, 1, 2, 3, 8, 9])
+
+  def test_whitespace_is_tolerated(self):
+    self.assertEqual(parse_cpu_list("  0-3 , 8 ,\t9  \n"), [0, 1, 2, 3, 8, 9])
+
+  def test_empty_means_memory_only_node(self):
+    self.assertEqual(parse_cpu_list(""), [])
+    self.assertEqual(parse_cpu_list("\n"), [])
+
+  def test_result_is_sorted_and_deduplicated(self):
+    self.assertEqual(parse_cpu_list("9,0-3,3,8"), [0, 1, 2, 3, 8, 9])
+
+  def test_garbage_is_rejected_not_guessed(self):
+    for bad in ("a-b", "3-1", "1--2", "x", "1-"):
+      with self.assertRaises(ValueError, msg=bad):
+        parse_cpu_list(bad)
+
+
+class TestFormatCpuList(unittest.TestCase):
+  def test_gaps_stay_visible(self):
+    # The old display printed f"{cpus[0]}-{cpus[-1]}", so an SMT node's
+    # 0-31,64-95 showed as 0-95: 32 CPUs that belong to another node.
+    self.assertEqual(format_cpu_list(list(range(32)) + list(range(64, 96))),
+                     "0-31,64-95")
+
+  def test_singles_and_pairs(self):
+    self.assertEqual(format_cpu_list([0, 1, 2, 3, 8, 9]), "0-3,8-9")
+    self.assertEqual(format_cpu_list([5]), "5")
+    self.assertEqual(format_cpu_list([1, 3, 5]), "1,3,5")
+
+  def test_empty_is_na(self):
+    self.assertEqual(format_cpu_list([]), "N/A")
+
+  def test_round_trips_through_the_parser(self):
+    cpus = [0, 1, 2, 3, 8, 9, 64, 65, 66]
+    self.assertEqual(parse_cpu_list(format_cpu_list(cpus)), cpus)
+
+
 class TestRamCoffersTopology(unittest.TestCase):
+  def test_parse_numactl_output_handles_smt_sibling_ranges(self):
+    output = "node 0 cpus: 0-31,64-95\nnode 0 size: 1 MB\n"
+    topology = _parse_numactl_output(output)
+    self.assertEqual(topology["nodes"][0]["cpus"],
+                     list(range(0, 32)) + list(range(64, 96)))
+
+  def test_parse_sysfs_numa_accepts_ranges_and_memory_only_nodes(self):
+    with tempfile.TemporaryDirectory() as base:
+      for node_id, cpulist in ((0, "0-31,64-95\n"), (1, "\n")):
+        node_path = os.path.join(base, f"node{node_id}")
+        os.makedirs(node_path)
+        with open(os.path.join(node_path, "cpulist"), "w") as f:
+          f.write(cpulist)
+      topology = _parse_sysfs_numa(base)
+    self.assertEqual(topology["nodes"][0]["cpus"],
+                     list(range(0, 32)) + list(range(64, 96)))
+    self.assertEqual(topology["nodes"][1]["cpus"], [])
+
+  def test_display_text_does_not_flatten_cpu_gaps(self):
+    topology = {
+      "num_nodes": 2,
+      "nodes": {
+        0: {"cpus": list(range(32)) + list(range(64, 96)), "size_mb": 1024},
+        1: {"cpus": [], "size_mb": 1024},
+      },
+    }
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+      display_topology_text(topology, {0: 50.0, 1: 50.0})
+    self.assertIn("CPUs 0-31,64-95", out.getvalue())
+    self.assertIn("CPUs N/A", out.getvalue())
+    self.assertNotIn("0-95", out.getvalue())
+
   def test_parse_numactl_output_expands_cpu_ranges_and_memory_fields(self):
     output = """
 available: 2 nodes (0-1)
