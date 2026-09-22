@@ -34,7 +34,14 @@ layout(push_constant) uniform Params {
 
 shared float partial[64];
 
-/* E4M3FN -> float. Bias 7, no infinities, 0x7F/0xFF are NaN (never stored). */
+/* E4M3FN -> float. Bias 7, no infinities, 0x7F/0xFF are NaN.
+ *
+ * The NaN branch must match kernels/fp8.c and gen9_cluster/fp8.py exactly:
+ * without it, 0x7F/0xFF decode to +/-480 here and to NaN on the CPU, and a
+ * fleet decodes the same shard two different ways. The CPU decoders are the
+ * reference; tests/test_gpu_decoder_parity.py checks this function against
+ * them over all 256 codes. GLSL has no NaN literal, so the quiet-NaN bit
+ * pattern is built directly. */
 float decode_e4m3(uint b)
 {
     uint sign = (b >> 7) & 0x1u;
@@ -43,6 +50,8 @@ float decode_e4m3(uint b)
     float mag;
     if (exp == 0u) {
         mag = float(mant) * 0.125 * exp2(-6.0);      // subnormal
+    } else if (exp == 0xFu && mant == 0x7u) {
+        return uintBitsToFloat(0x7FC00000u);         // NaN, same as the CPU
     } else {
         mag = (1.0 + float(mant) * 0.125) * exp2(float(exp) - 7.0);
     }
