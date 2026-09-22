@@ -18,6 +18,54 @@ import subprocess
 from typing import Dict, List, Optional, Tuple
 
 
+def parse_cpu_list(text: str) -> List[int]:
+    """Parse a Linux CPU list into sorted, de-duplicated CPU ids.
+
+    Accepts every spelling the two sources use: ``numactl --hardware`` prints
+    space-separated ids or ranges (``0 1 2 3``, ``0-31 64-95``), sysfs
+    ``cpulist`` is comma-separated (``0-31,64-95``), and hand-edited or
+    piped input may mix the two with stray whitespace (`` 0-3, 8 , 9 ``).
+    An empty string is a memory-only node, which POWER8 boxes really have,
+    and yields ``[]`` rather than crashing on ``int('')``.
+    """
+    cpus = set()
+    for token in text.replace(',', ' ').split():
+        if '-' in token:
+            start, sep, end = token.partition('-')
+            if not (start.strip().isdigit() and end.strip().isdigit()):
+                raise ValueError(f"bad CPU range: {token!r}")
+            lo, hi = int(start), int(end)
+            if lo > hi:
+                raise ValueError(f"bad CPU range: {token!r}")
+            cpus.update(range(lo, hi + 1))
+        elif token.isdigit():
+            cpus.add(int(token))
+        else:
+            raise ValueError(f"bad CPU id: {token!r}")
+    return sorted(cpus)
+
+
+def format_cpu_list(cpus: List[int]) -> str:
+    """Render CPU ids in Linux cpulist form, keeping gaps visible.
+
+    ``[0, 1, 2, 3, 8, 9]`` becomes ``0-3,8-9``; a NUMA node holding SMT
+    siblings ``0-31,64-95`` is shown as exactly that, not as ``0-95``.
+    """
+    if not cpus:
+        return "N/A"
+    ordered = sorted(set(cpus))
+    runs = []
+    start = prev = ordered[0]
+    for cpu in ordered[1:]:
+        if cpu == prev + 1:
+            prev = cpu
+            continue
+        runs.append((start, prev))
+        start = prev = cpu
+    runs.append((start, prev))
+    return ",".join(f"{a}-{b}" if a != b else str(a) for a, b in runs)
+
+
 def detect_numa_linux() -> Optional[Dict]:
     """Detect NUMA topology on Linux systems."""
     try:
@@ -57,15 +105,8 @@ def _parse_numactl_output(output: str) -> Dict:
         )
 
         if field == 'cpus':
-            # Parse CPU list: "0 1 2 3 4 5 6 7" or "0-7"
-            cpus = []
-            for part in parts[3:]:
-                if '-' in part:
-                    start, end = part.split('-')
-                    cpus.extend(range(int(start), int(end) + 1))
-                else:
-                    cpus.append(int(part))
-            nodes[node_id]['cpus'] = cpus
+            # "0 1 2 3", "0-7", or "0-31,64-95" — parse_cpu_list takes all.
+            nodes[node_id]['cpus'] = parse_cpu_list(' '.join(parts[3:]))
         elif field == 'size' and len(parts) >= 4:
             nodes[node_id]['size_mb'] = int(parts[3])
         elif field == 'free' and len(parts) >= 4:
@@ -101,15 +142,8 @@ def _parse_sysfs_numa(node_dir: str = '/sys/devices/system/node') -> Optional[Di
         cpulist_path = os.path.join(node_path, 'cpulist')
         if os.path.exists(cpulist_path):
             with open(cpulist_path, 'r') as f:
-                cpu_str = f.read().strip()
-                cpus = []
-                for part in cpu_str.split(','):
-                    if '-' in part:
-                        start, end = part.split('-')
-                        cpus.extend(range(int(start), int(end) + 1))
-                    else:
-                        cpus.append(int(part))
-                node_info['cpus'] = cpus
+                # Empty on a memory-only node; parse_cpu_list returns [].
+                node_info['cpus'] = parse_cpu_list(f.read())
         
         # Read memory info
         meminfo_path = os.path.join(node_path, 'meminfo')
@@ -269,8 +303,7 @@ def display_topology_text(topology: Dict, weights: Dict[int, float]) -> None:
         is_last = (i == num_nodes - 1)
         prefix = "└──" if is_last else "├──"
         
-        cpus = info.get('cpus', [])
-        cpu_str = f"{cpus[0]}-{cpus[-1]}" if cpus else "N/A"
+        cpu_str = format_cpu_list(info.get('cpus', []))
         memory_gb = info.get('size_mb', 0) / 1024
         weight = weights.get(node_id, 0)
         
