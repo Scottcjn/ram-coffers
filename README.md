@@ -445,11 +445,29 @@ Apple Silicon chips (M1/M2/M3/M4) use **Unified Memory Architecture** — CPU an
 - AES entropy uses **ARM Crypto Extensions** (`vaeseq_u8`) instead of POWER8 `vcipher`.
 
 ### x86 Systems
-On **x86/amd64** (Intel/AMD) without POWER8 ISA support:
+On **x86_64** (Intel/AMD) the picture is split by header, not all-or-nothing
+(verified by compiling each root header with GCC 14 on x86_64 Linux with
+`libnuma-dev` installed):
 
-- **Compilation will fail** — the core headers require POWER8 vector intrinsics (`vec_perm`, `vcipher`, `vec_xl`).
-- The `power8-compat.h` header provides compatibility macros but does not emulate the POWER8 instructions on x86.
-- For x86 use, consider the Apple Silicon port as a reference for implementing SIMD collapse with SSE/AVX intrinsics, though this is not currently provided.
+- **Coffer headers compile and run**: `ggml-ram-coffers.h`, `ggml-neuromorphic-coffers.h`,
+  `ggml-ram-coffer.h`, `ggml-coffer-mmap.h` and `pse-entropy-burst.h` (C++).
+  `dcbt` prefetch becomes a no-op, the AltiVec dot product falls back to a
+  scalar loop, and `mftb` entropy falls back to `rdtsc`. The two single-coffer
+  headers include `<numa.h>` unconditionally, so Linux + `libnuma` is required;
+  see the Build Matrix below.
+- **The three collapse kernels are POWER8-only by design**:
+  `ggml-vcipher-collapse.h`, `ggml-intelligent-collapse.h` and
+  `ggml-topk-collapse-vsx.h` (and `ggml-pse-integration.h`, which includes them)
+  include `<altivec.h>` and will not compile on x86.
+- **The x86-64 collapse port is `x86-64/aes-collapse.h`** (AES-NI, see the
+  [x86-64 Port](#x86-64-port-august-2026) section above and
+  [`x86-64/README.md`](x86-64/README.md)). It is a separate header, not a
+  drop-in for the POWER8 kernels, and `make bench` in that directory runs its
+  own checks.
+- `power8-compat.h` is gated on `__POWER8_VECTOR__` and expands to nothing on
+  x86; it neither emulates POWER8 instructions nor breaks the build.
+
+Off-POWER8 runs are correctness validation, not performance evidence.
 
 ### Non-POWER8 ppc64le (e.g., POWER9, POWER10)
 On newer POWER processors:
@@ -466,8 +484,8 @@ On newer POWER processors:
 | POWER9/POWER10 | Full multi-bank routing | vec_perm + vcipher (compat) | ✅ Works |
 | Single-NUMA ppc64le | Single-bank (all collapsed) | vec_perm + vcipher | ✅ Works with reduced perf |
 | Apple Silicon | Cache-tier banking | NEON + AES crypto | ✅ Works (see apple-silicon/) |
-| x86 (Intel/AMD) | N/A | N/A | ❌ Compile error |
-| ARM (non-Apple) | N/A | N/A | ❌ Not supported |
+| x86_64 Linux (Intel/AMD) | Full routing (libnuma), scalar math, no `dcbt` | AES-NI port in `x86-64/` (POWER8 collapse headers do not compile) | ⚠️ Works, correctness only |
+| aarch64 Linux (non-Apple) | Full routing (libnuma), scalar math, no `dcbt` | None (POWER8 collapse headers do not compile) | ⚠️ Coffer headers only |
 
 ## License
 
@@ -706,7 +724,7 @@ RAM Coffers is part of a vertically integrated DePIN system where **the hardware
 | **Memory** | **RAM Coffers** (this repo) | NUMA-distributed weight banking, resonance routing |
 | **Inference** | [llama-cpp-power8](https://github.com/Scottcjn/llama-cpp-power8) | vec_perm collapse, PSE entropy, DCBT prefetch |
 | **Consensus** | [RustChain](https://github.com/Scottcjn/Rustchain) | Proof of Antiquity — 1 CPU = 1 Vote, vintage hardware earns more |
-| **DePIN** | [RustChain Network](https://rustchain.org) | 4 attestation nodes, hardware fingerprinting, RTC token rewards |
+| **DePIN** | [RustChain Network](https://rustchain.org) | Attestation nodes (2 live as of Sept 2026; volunteer nodes come and go), hardware fingerprinting, RTC token rewards |
 
 The same POWER8 S824 that hits 147 t/s with RAM Coffers also mines RTC via Proof of Antiquity. Real hardware doing real AI work, earning real tokens. No cloud. No API landlords. No rented cognition.
 
@@ -739,8 +757,9 @@ The same POWER8 S824 that hits 147 t/s with RAM Coffers also mines RTC via Proof
 |---|---|---|---|---|
 | **POWER8 Multi-Node** | Linux (ppc64le) | Native 4-Node `mbind` | Native `dcbt` Streams | AltiVec / VSX |
 | **POWER8 Single-Node** | Linux (ppc64le) | Node 0 Fallback | Native `dcbt` Streams | AltiVec / VSX |
-| **x86_64** | Linux / macOS / Windows | Anonymous `mmap` Fallback | No-Op (`(void)`) | Scalar C Loop |
-| **aarch64 / Apple Silicon** | Linux / macOS | Anonymous `mmap` Fallback | No-Op (`(void)`) | Scalar C Loop |
+| **x86_64** | Linux (needs `libnuma`; `ggml-ram-coffer.h` and `ggml-coffer-mmap.h` include `<numa.h>` unconditionally) | `mbind` if libnuma reports NUMA, else anonymous `mmap` fallback | No-Op (`(void)`) | Scalar C Loop (AES-NI collapse lives in `x86-64/`) |
+| **aarch64** | Linux (needs `libnuma`, same caveat) | `mbind` if libnuma reports NUMA, else anonymous `mmap` fallback | No-Op (`(void)`) | Scalar C Loop |
+| **Apple Silicon** | macOS via the separate `apple-silicon/` port (root coffer headers except `ggml-ram-coffers.h` fail without libnuma) | Cache-tier banking | No-Op (`(void)`) | NEON + ARM AES |
 
 ---
 
