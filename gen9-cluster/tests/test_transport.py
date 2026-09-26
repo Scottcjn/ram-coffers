@@ -14,7 +14,7 @@ import unittest
 import numpy as np
 
 from gen9_cluster import fp8
-from gen9_cluster.errors import ConnectError, Gen9Error
+from gen9_cluster.errors import CapacityError, ConnectError, Gen9Error
 from gen9_cluster.node import ExpertWeights, NodeServer, ShardStore
 from gen9_cluster.protocol import (DType, ExpertBatchPayload,
                                    ExpertRowsPayload, Flags, Frame, MsgType,
@@ -178,6 +178,25 @@ class TestExpertExecution(NodeFixture):
         self.assertTrue(self.store.holds(1, 0))
         self.assertTrue(self.store.holds(1, 1))
 
+    def test_resending_a_shard_does_not_double_count_residency(self):
+        """A LOAD_SHARD that timed out is re-sent. The node must replace the
+        experts it already holds, not count their bytes twice: otherwise
+        STATUS over-reports residency and a node sized for its plan refuses
+        the retry with a CapacityError it does not deserve."""
+        header = ShardHeader(layer=3, first_expert=0, n_experts=2,
+                             hidden_size=HIDDEN, intermediate_size=INTERMEDIATE)
+        body = np.ones(2 * 3 * HIDDEN * INTERMEDIATE, dtype=np.float32)
+        frame_bytes = header.encode() + body.tobytes()
+        before = self.store.resident_bytes
+        # Room for exactly this shard on top of what the fixture holds.
+        self.store.capacity_bytes = before + body.nbytes
+        conn = self.connect()
+        for _ in range(3):
+            reply = conn.request(Frame(MsgType.LOAD_SHARD, 0, frame_bytes))
+            self.assertEqual(reply.msg_type, MsgType.LOAD_ACK)
+            self.assertEqual(self.store.resident_bytes, before + body.nbytes)
+        self.assertEqual(len(self.store), self.n_experts + 2)
+
     def test_a_shard_body_of_the_wrong_size_is_refused(self):
         conn = self.connect()
         header = ShardHeader(layer=2, first_expert=0, n_experts=2,
@@ -268,6 +287,34 @@ class TestMultiplexing(NodeFixture):
             rid = conn._next_request_id()
             self.assertNotIn(rid, seen)
             seen.add(rid)
+
+
+class TestShardStoreAccounting(unittest.TestCase):
+    def test_moving_a_shard_to_storage_releases_its_ram(self):
+        """A replan that demotes an expert to the NVMe tier gives its RAM
+        back; the replaced RAM copy must stop being counted."""
+        store = ShardStore()
+        expert = make_expert(0)
+        store.put(0, 0, expert)
+        self.assertEqual(store.resident_bytes, expert.nbytes)
+        demoted = ExpertWeights(gate=expert.gate, up=expert.up,
+                                down=expert.down, tier="ssd")
+        store.put(0, 0, demoted)
+        self.assertEqual(store.resident_bytes, 0)
+        self.assertIs(store.get(0, 0), demoted)
+
+    def test_a_refused_replacement_keeps_the_old_copy_and_its_count(self):
+        store = ShardStore(capacity_bytes=make_expert(0).nbytes)
+        original = make_expert(0)
+        store.put(0, 0, original)
+        bigger = ExpertWeights(
+            gate=np.zeros((INTERMEDIATE * 2, HIDDEN), dtype=np.float32),
+            up=np.zeros((INTERMEDIATE * 2, HIDDEN), dtype=np.float32),
+            down=np.zeros((HIDDEN, INTERMEDIATE * 2), dtype=np.float32))
+        with self.assertRaises(CapacityError):
+            store.put(0, 0, bigger)
+        self.assertIs(store.get(0, 0), original)
+        self.assertEqual(store.resident_bytes, original.nbytes)
 
 
 class TestFailures(unittest.TestCase):

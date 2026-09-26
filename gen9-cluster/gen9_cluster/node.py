@@ -158,18 +158,29 @@ class ShardStore:
         self.resident_bytes = 0
 
     def put(self, layer: int, expert: int, weights: ExpertWeights) -> None:
+        """Hold ``weights`` as (layer, expert), replacing any earlier copy.
+
+        Replacing is the normal case, not an edge: a coordinator whose
+        LOAD_SHARD timed out re-sends it, and a replan reloads a shard in a
+        different tier. The replaced copy's bytes are released in the same
+        step, so a reload neither double-counts residency nor trips the
+        capacity check against memory the old copy is about to give back.
+        """
         with self._lock:
-            if (self.capacity_bytes and weights.tier != "ssd"
-                    and self.resident_bytes + weights.nbytes
-                    > self.capacity_bytes):
+            key = (layer, expert)
+            old = self._experts.get(key)
+            released = (old.nbytes if old is not None and old.tier != "ssd"
+                        else 0)
+            added = weights.nbytes if weights.tier != "ssd" else 0
+            after = self.resident_bytes - released + added
+            if self.capacity_bytes and added and after > self.capacity_bytes:
                 raise CapacityError(
                     f"shard would take the node to "
-                    f"{(self.resident_bytes + weights.nbytes) / 2**30:.2f} GiB "
+                    f"{after / 2**30:.2f} GiB "
                     f"against a {self.capacity_bytes / 2**30:.2f} GiB budget",
                     layer=layer, expert=expert)
-            self._experts[(layer, expert)] = weights
-            if weights.tier != "ssd":
-                self.resident_bytes += weights.nbytes
+            self._experts[key] = weights
+            self.resident_bytes = after
 
     def get(self, layer: int, expert: int) -> ExpertWeights:
         try:
