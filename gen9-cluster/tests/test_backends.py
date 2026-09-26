@@ -9,8 +9,8 @@ import unittest
 
 import numpy as np
 
-from gen9_cluster.backends import (CpuKernelRunner, describe_backends,
-                                   select_runner)
+from gen9_cluster.backends import (_DEFAULT_LIB, CpuKernelRunner,
+                                   describe_backends, select_runner)
 from gen9_cluster.node import ExpertRunner, ExpertWeights
 
 HIDDEN = 64
@@ -92,8 +92,14 @@ class TestSelection(unittest.TestCase):
         self.assertTrue(callable(select_runner()))
 
     def test_an_unavailable_gpu_backend_falls_back_visibly(self):
+        """With no GPU runner wired up, the node gets the CPU kernel if it
+        built and the numpy reference if not — and says which in its name.
+        (This used to expect "numpy", a name no runner has, so it only passed
+        on a machine where the kernel had been built.)"""
         runner = select_runner("vulkan")
-        self.assertIn(runner.name, {"cpu-avx2", "numpy"})
+        self.assertIn(runner.name, {CpuKernelRunner.name, ExpertRunner.name})
+        if not _DEFAULT_LIB.exists():
+            self.assertEqual(runner.name, ExpertRunner.name)
 
     def test_probe_reports_each_backend(self):
         text = "\n".join(describe_backends())

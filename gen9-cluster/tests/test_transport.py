@@ -14,7 +14,7 @@ import unittest
 import numpy as np
 
 from gen9_cluster import fp8
-from gen9_cluster.errors import ConnectError, Gen9Error
+from gen9_cluster.errors import CapacityError, ConnectError, Gen9Error
 from gen9_cluster.node import ExpertWeights, NodeServer, ShardStore
 from gen9_cluster.protocol import (DType, ExpertBatchPayload,
                                    ExpertRowsPayload, Flags, Frame, MsgType,
@@ -178,6 +178,25 @@ class TestExpertExecution(NodeFixture):
         self.assertTrue(self.store.holds(1, 0))
         self.assertTrue(self.store.holds(1, 1))
 
+    def test_resending_a_shard_does_not_double_count_residency(self):
+        """A LOAD_SHARD that timed out is re-sent. The node must replace the
+        experts it already holds, not count their bytes twice: otherwise
+        STATUS over-reports residency and a node sized for its plan refuses
+        the retry with a CapacityError it does not deserve."""
+        header = ShardHeader(layer=3, first_expert=0, n_experts=2,
+                             hidden_size=HIDDEN, intermediate_size=INTERMEDIATE)
+        body = np.ones(2 * 3 * HIDDEN * INTERMEDIATE, dtype=np.float32)
+        frame_bytes = header.encode() + body.tobytes()
+        before = self.store.resident_bytes
+        # Room for exactly this shard on top of what the fixture holds.
+        self.store.capacity_bytes = before + body.nbytes
+        conn = self.connect()
+        for _ in range(3):
+            reply = conn.request(Frame(MsgType.LOAD_SHARD, 0, frame_bytes))
+            self.assertEqual(reply.msg_type, MsgType.LOAD_ACK)
+            self.assertEqual(self.store.resident_bytes, before + body.nbytes)
+        self.assertEqual(len(self.store), self.n_experts + 2)
+
     def test_a_shard_body_of_the_wrong_size_is_refused(self):
         conn = self.connect()
         header = ShardHeader(layer=2, first_expert=0, n_experts=2,
@@ -270,6 +289,34 @@ class TestMultiplexing(NodeFixture):
             seen.add(rid)
 
 
+class TestShardStoreAccounting(unittest.TestCase):
+    def test_moving_a_shard_to_storage_releases_its_ram(self):
+        """A replan that demotes an expert to the NVMe tier gives its RAM
+        back; the replaced RAM copy must stop being counted."""
+        store = ShardStore()
+        expert = make_expert(0)
+        store.put(0, 0, expert)
+        self.assertEqual(store.resident_bytes, expert.nbytes)
+        demoted = ExpertWeights(gate=expert.gate, up=expert.up,
+                                down=expert.down, tier="ssd")
+        store.put(0, 0, demoted)
+        self.assertEqual(store.resident_bytes, 0)
+        self.assertIs(store.get(0, 0), demoted)
+
+    def test_a_refused_replacement_keeps_the_old_copy_and_its_count(self):
+        store = ShardStore(capacity_bytes=make_expert(0).nbytes)
+        original = make_expert(0)
+        store.put(0, 0, original)
+        bigger = ExpertWeights(
+            gate=np.zeros((INTERMEDIATE * 2, HIDDEN), dtype=np.float32),
+            up=np.zeros((INTERMEDIATE * 2, HIDDEN), dtype=np.float32),
+            down=np.zeros((HIDDEN, INTERMEDIATE * 2), dtype=np.float32))
+        with self.assertRaises(CapacityError):
+            store.put(0, 0, bigger)
+        self.assertIs(store.get(0, 0), original)
+        self.assertEqual(store.resident_bytes, original.nbytes)
+
+
 class TestFailures(unittest.TestCase):
     def test_connecting_to_nothing_is_a_retry_safe_error(self):
         """Nothing was sent, so retrying cannot duplicate work."""
@@ -312,6 +359,123 @@ class TestFailures(unittest.TestCase):
             thread.join(timeout=10)
         conn.close()
         self.assertFalse(conn.connected)
+
+    def test_a_connection_the_peer_closed_fails_fast_not_by_timeout(self):
+        """Once the reader has seen the peer go away, nothing will ever answer
+        on this socket. The connection must say so — so a pool stops handing
+        it out — and a new request must fail at once with a retry-safe
+        ConnectError, not hang for its whole timeout and surface as a
+        non-retry-safe TimeoutError_."""
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        accepted = threading.Event()
+
+        def accept_then_hang_up():
+            client, _ = listener.accept()
+            client.close()
+            accepted.set()
+
+        thread = threading.Thread(target=accept_then_hang_up, daemon=True)
+        thread.start()
+        conn = NodeConnection("rebooted", "127.0.0.1",
+                              listener.getsockname()[1])
+        conn.connect()
+        self.addCleanup(conn.close)
+        self.assertTrue(accepted.wait(5.0))
+        deadline = time.monotonic() + 5.0
+        while conn.connected and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(conn.connected)
+
+        started = time.monotonic()
+        with self.assertRaises(ConnectError) as caught:
+            conn.request(Frame(MsgType.PING, 0), timeout=5.0)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(caught.exception.retry_safe)
+        thread.join(timeout=5)
+
+    def test_a_pool_replaces_a_connection_the_peer_closed(self):
+        store = ShardStore()
+        node = NodeServer(store, unit_id="flaky", host="127.0.0.1", port=0)
+        port = node.start()
+        self.addCleanup(node.stop)
+        with ConnectionPool() as pool:
+            first = pool.get("flaky", "127.0.0.1", port)
+            # The node answers SHUTDOWN by closing this connection.
+            first.send_oneway(Frame(MsgType.SHUTDOWN, 0))
+            deadline = time.monotonic() + 5.0
+            while first.connected and time.monotonic() < deadline:
+                time.sleep(0.01)
+            second = pool.get("flaky", "127.0.0.1", port)
+            self.assertIsNot(second, first)
+            self.assertEqual(second.request(Frame(MsgType.PING, 0),
+                                            timeout=5.0).msg_type,
+                             MsgType.PONG)
+
+    def _shut_down_and_wait_dead(self, conn):
+        # The node answers SHUTDOWN by closing this connection.
+        conn.send_oneway(Frame(MsgType.SHUTDOWN, 0))
+        deadline = time.monotonic() + 5.0
+        while conn.connected and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(conn.connected)
+
+    def _node(self, unit_id):
+        node = NodeServer(ShardStore(), unit_id=unit_id, host="127.0.0.1",
+                          port=0)
+        port = node.start()
+        self.addCleanup(node.stop)
+        return port
+
+    def test_a_stale_reader_cannot_fail_requests_on_a_reopened_socket(self):
+        """close() already failed the old socket's waiters; anything pending
+        after a reconnect belongs to the new socket and must be left alone
+        when the old reader reports its exit late."""
+        port = self._node("reopened")
+        conn = NodeConnection("reopened", "127.0.0.1", port)
+        conn.connect()
+        self.addCleanup(conn.close)
+        old_sock = conn._sock
+        conn.close()
+        conn.connect()
+        # Stand in for a request that is in flight on the new socket.
+        from gen9_cluster.transport import _Pending
+        waiter = _Pending()
+        with conn._pending_lock:
+            conn._pending[999] = waiter
+        conn._fail_all(ConnectError("stale old reader"), dead_sock=old_sock)
+        self.assertFalse(waiter.event.is_set())
+        self.assertIsNone(waiter.error)
+        self.assertTrue(conn.connected)
+        with conn._pending_lock:
+            conn._pending.pop(999, None)
+        self.assertEqual(conn.request(Frame(MsgType.PING, 0),
+                                      timeout=5.0).msg_type, MsgType.PONG)
+
+    def test_send_oneway_on_a_dead_connection_raises(self):
+        """A one-way message into a half-closed socket must not vanish."""
+        port = self._node("oneway")
+        conn = NodeConnection("oneway", "127.0.0.1", port)
+        conn.connect()
+        self.addCleanup(conn.close)
+        self._shut_down_and_wait_dead(conn)
+        with self.assertRaises(ConnectError) as caught:
+            conn.send_oneway(Frame(MsgType.SHUTDOWN, 0))
+        self.assertTrue(caught.exception.retry_safe)
+
+    def test_connect_recovers_a_dead_connection(self):
+        """Without a pool, connect() is how a caller recovers."""
+        port = self._node("recover")
+        conn = NodeConnection("recover", "127.0.0.1", port)
+        conn.connect()
+        self.addCleanup(conn.close)
+        self._shut_down_and_wait_dead(conn)
+        conn.connect()
+        self.assertTrue(conn.connected)
+        self.assertEqual(conn.request(Frame(MsgType.PING, 0),
+                                      timeout=5.0).msg_type, MsgType.PONG)
 
     def test_a_peer_speaking_nonsense_is_a_protocol_error(self):
         """Not every listener on port 9713 is a console."""
