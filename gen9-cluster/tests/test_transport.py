@@ -414,6 +414,69 @@ class TestFailures(unittest.TestCase):
                                             timeout=5.0).msg_type,
                              MsgType.PONG)
 
+    def _shut_down_and_wait_dead(self, conn):
+        # The node answers SHUTDOWN by closing this connection.
+        conn.send_oneway(Frame(MsgType.SHUTDOWN, 0))
+        deadline = time.monotonic() + 5.0
+        while conn.connected and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(conn.connected)
+
+    def _node(self, unit_id):
+        node = NodeServer(ShardStore(), unit_id=unit_id, host="127.0.0.1",
+                          port=0)
+        port = node.start()
+        self.addCleanup(node.stop)
+        return port
+
+    def test_a_stale_reader_cannot_fail_requests_on_a_reopened_socket(self):
+        """close() already failed the old socket's waiters; anything pending
+        after a reconnect belongs to the new socket and must be left alone
+        when the old reader reports its exit late."""
+        port = self._node("reopened")
+        conn = NodeConnection("reopened", "127.0.0.1", port)
+        conn.connect()
+        self.addCleanup(conn.close)
+        old_sock = conn._sock
+        conn.close()
+        conn.connect()
+        # Stand in for a request that is in flight on the new socket.
+        from gen9_cluster.transport import _Pending
+        waiter = _Pending()
+        with conn._pending_lock:
+            conn._pending[999] = waiter
+        conn._fail_all(ConnectError("stale old reader"), dead_sock=old_sock)
+        self.assertFalse(waiter.event.is_set())
+        self.assertIsNone(waiter.error)
+        self.assertTrue(conn.connected)
+        with conn._pending_lock:
+            conn._pending.pop(999, None)
+        self.assertEqual(conn.request(Frame(MsgType.PING, 0),
+                                      timeout=5.0).msg_type, MsgType.PONG)
+
+    def test_send_oneway_on_a_dead_connection_raises(self):
+        """A one-way message into a half-closed socket must not vanish."""
+        port = self._node("oneway")
+        conn = NodeConnection("oneway", "127.0.0.1", port)
+        conn.connect()
+        self.addCleanup(conn.close)
+        self._shut_down_and_wait_dead(conn)
+        with self.assertRaises(ConnectError) as caught:
+            conn.send_oneway(Frame(MsgType.SHUTDOWN, 0))
+        self.assertTrue(caught.exception.retry_safe)
+
+    def test_connect_recovers_a_dead_connection(self):
+        """Without a pool, connect() is how a caller recovers."""
+        port = self._node("recover")
+        conn = NodeConnection("recover", "127.0.0.1", port)
+        conn.connect()
+        self.addCleanup(conn.close)
+        self._shut_down_and_wait_dead(conn)
+        conn.connect()
+        self.assertTrue(conn.connected)
+        self.assertEqual(conn.request(Frame(MsgType.PING, 0),
+                                      timeout=5.0).msg_type, MsgType.PONG)
+
     def test_a_peer_speaking_nonsense_is_a_protocol_error(self):
         """Not every listener on port 9713 is a console."""
         listener = socket.socket()

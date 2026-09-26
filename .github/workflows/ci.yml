@@ -6,10 +6,7 @@ name: CI
 # tests are exercised. Previously this job only ran `echo "Docs updated"`,
 # which reported green on every push without testing anything.
 
-on:
-  push:
-    branches: [ main ]
-  pull_request:
+on: [push, pull_request]
 
 permissions:
   contents: read

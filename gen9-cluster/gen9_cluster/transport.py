@@ -75,8 +75,17 @@ class NodeConnection:
 
     # -- lifecycle --------------------------------------------------------
     def connect(self) -> None:
+        """Open the socket; a no-op if already up, a reconnect if dead.
+
+        A connection whose reader has exited still holds its old socket, so
+        "already have a socket" is not the same as "already connected". Such a
+        connection is closed and reopened here, so calling connect() is enough
+        to recover it without going through a pool.
+        """
         if self._sock is not None:
-            return
+            if self._dead is None:
+                return
+            self.close()
         try:
             sock = socket.create_connection((self.host, self.port),
                                             timeout=self.connect_timeout)
@@ -173,6 +182,12 @@ class NodeConnection:
         if self._sock is None:
             self.connect()
         with self._lock:
+            if self._dead is not None:
+                # The half-closed socket may still accept the bytes, so without
+                # this check a one-way message would vanish without an error.
+                raise ConnectError(
+                    f"connection is dead ({self._dead}); nothing was sent",
+                    unit_id=self.unit_id)
             frame.request_id = 0
             try:
                 self._sock.sendall(frame.encode())    # type: ignore[union-attr]
@@ -226,14 +241,18 @@ class NodeConnection:
         Otherwise a pool keeps handing it out and every request sent into it
         waits its full timeout and surfaces as a non-retry-safe timeout.
 
-        ``dead_sock`` is the socket the exiting reader owned. It only marks the
-        connection dead if it is still the current socket, so a reader that
-        outlives :meth:`close` cannot poison a connection reopened after it.
+        ``dead_sock`` is the socket the exiting reader owned. If it is no
+        longer the current socket, the reader outlived :meth:`close` (which
+        already failed that socket's waiters), and everything in ``_pending``
+        now belongs to a newer socket. A stale reader therefore neither marks
+        the connection dead nor touches its pending requests.
         """
         with self._pending_lock:
-            if (dead_sock is not None and dead_sock is self._sock
-                    and self._dead is None):
-                self._dead = exc
+            if dead_sock is not None:
+                if dead_sock is not self._sock:
+                    return
+                if self._dead is None:
+                    self._dead = exc
             pending, self._pending = self._pending, {}
         for item in pending.values():
             item.error = exc
