@@ -1,8 +1,39 @@
 name: CI
-on: [push,pull_request]
+
+# Runs the Python test suite twice: once with no compiled kernel (the numpy
+# fallback every console must be able to serve with) and once with the AVX2
+# CPU kernel built, so both ExpertRunner paths and the C/Python FP8 parity
+# tests are exercised. Previously this job only ran `echo "Docs updated"`,
+# which reported green on every push without testing anything.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: echo "Docs updated"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest numpy
+
+      - name: Tests (no compiled kernel, numpy fallback)
+        run: python -m pytest -q
+
+      - name: Build and self-test the CPU kernel
+        run: |
+          make -C gen9-cluster/kernels
+          make -C gen9-cluster/kernels test
+
+      - name: Tests (with the CPU kernel)
+        run: python -m pytest -q
