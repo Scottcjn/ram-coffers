@@ -313,6 +313,60 @@ class TestFailures(unittest.TestCase):
         conn.close()
         self.assertFalse(conn.connected)
 
+    def test_a_connection_the_peer_closed_fails_fast_not_by_timeout(self):
+        """Once the reader has seen the peer go away, nothing will ever answer
+        on this socket. The connection must say so — so a pool stops handing
+        it out — and a new request must fail at once with a retry-safe
+        ConnectError, not hang for its whole timeout and surface as a
+        non-retry-safe TimeoutError_."""
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        accepted = threading.Event()
+
+        def accept_then_hang_up():
+            client, _ = listener.accept()
+            client.close()
+            accepted.set()
+
+        thread = threading.Thread(target=accept_then_hang_up, daemon=True)
+        thread.start()
+        conn = NodeConnection("rebooted", "127.0.0.1",
+                              listener.getsockname()[1])
+        conn.connect()
+        self.addCleanup(conn.close)
+        self.assertTrue(accepted.wait(5.0))
+        deadline = time.monotonic() + 5.0
+        while conn.connected and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(conn.connected)
+
+        started = time.monotonic()
+        with self.assertRaises(ConnectError) as caught:
+            conn.request(Frame(MsgType.PING, 0), timeout=5.0)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(caught.exception.retry_safe)
+        thread.join(timeout=5)
+
+    def test_a_pool_replaces_a_connection_the_peer_closed(self):
+        store = ShardStore()
+        node = NodeServer(store, unit_id="flaky", host="127.0.0.1", port=0)
+        port = node.start()
+        self.addCleanup(node.stop)
+        with ConnectionPool() as pool:
+            first = pool.get("flaky", "127.0.0.1", port)
+            # The node answers SHUTDOWN by closing this connection.
+            first.send_oneway(Frame(MsgType.SHUTDOWN, 0))
+            deadline = time.monotonic() + 5.0
+            while first.connected and time.monotonic() < deadline:
+                time.sleep(0.01)
+            second = pool.get("flaky", "127.0.0.1", port)
+            self.assertIsNot(second, first)
+            self.assertEqual(second.request(Frame(MsgType.PING, 0),
+                                            timeout=5.0).msg_type,
+                             MsgType.PONG)
+
     def test_a_peer_speaking_nonsense_is_a_protocol_error(self):
         """Not every listener on port 9713 is a console."""
         listener = socket.socket()

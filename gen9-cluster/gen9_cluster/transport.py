@@ -68,6 +68,10 @@ class NodeConnection:
         self._next_id = 1
         self._reader: Optional[threading.Thread] = None
         self._closed = False
+        #: Set once the reader thread has exited. After that nothing will ever
+        #: complete a pending request on this socket, so a new request must
+        #: fail at once instead of waiting out its whole timeout.
+        self._dead: Optional[BaseException] = None
 
     # -- lifecycle --------------------------------------------------------
     def connect(self) -> None:
@@ -83,6 +87,7 @@ class NodeConnection:
         sock.settimeout(None)
         self._sock = sock
         self._closed = False
+        self._dead = None
         self._reader = threading.Thread(target=self._read_loop,
                                         name=f"g9xc-{self.unit_id}",
                                         daemon=True)
@@ -108,7 +113,8 @@ class NodeConnection:
 
     @property
     def connected(self) -> bool:
-        return self._sock is not None and not self._closed
+        return (self._sock is not None and not self._closed
+                and self._dead is None)
 
     # -- request/response -------------------------------------------------
     def request(self, frame: Frame, *,
@@ -121,6 +127,12 @@ class NodeConnection:
             request_id = self._next_request_id()
             frame.request_id = request_id
             with self._pending_lock:
+                # Checked under the same lock _fail_all takes, so a request
+                # either sees the reader's death here or is failed by it.
+                if self._dead is not None:
+                    raise ConnectError(
+                        f"connection is dead ({self._dead}); nothing was sent",
+                        unit_id=self.unit_id)
                 self._pending[request_id] = pending
             try:
                 self._sock.sendall(frame.encode())    # type: ignore[union-attr]
@@ -195,17 +207,33 @@ class NodeConnection:
                 pending.frame = frame
                 pending.event.set()
         except (ConnectError, ProtocolError) as exc:
-            self._fail_all(exc)
+            self._fail_all(exc, dead_sock=sock)
         except OSError as exc:
             if not self._closed and exc.errno not in (errno.EBADF,):
-                self._fail_all(ConnectError(f"read failed: {exc}",
-                                            unit_id=self.unit_id))
+                failure = ConnectError(f"read failed: {exc}",
+                                       unit_id=self.unit_id)
             else:
-                self._fail_all(ConnectError("connection closed",
-                                            unit_id=self.unit_id))
+                failure = ConnectError("connection closed",
+                                       unit_id=self.unit_id)
+            self._fail_all(failure, dead_sock=sock)
 
-    def _fail_all(self, exc: BaseException) -> None:
+    def _fail_all(self, exc: BaseException, *,
+                  dead_sock: Optional[socket.socket] = None) -> None:
+        """Fail every waiter; from the reader, also refuse future requests.
+
+        The reader thread is the only thing that completes a request, so once
+        it has exited the connection must stop reporting itself as connected.
+        Otherwise a pool keeps handing it out and every request sent into it
+        waits its full timeout and surfaces as a non-retry-safe timeout.
+
+        ``dead_sock`` is the socket the exiting reader owned. It only marks the
+        connection dead if it is still the current socket, so a reader that
+        outlives :meth:`close` cannot poison a connection reopened after it.
+        """
         with self._pending_lock:
+            if (dead_sock is not None and dead_sock is self._sock
+                    and self._dead is None):
+                self._dead = exc
             pending, self._pending = self._pending, {}
         for item in pending.values():
             item.error = exc
