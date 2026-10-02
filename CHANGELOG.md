@@ -12,6 +12,10 @@ RAM Coffers is a NUMA-distributed conditional-memory architecture for LLM infere
 
 Tracking the next release on `main`. See open issues and PRs on the [GitHub repo](https://github.com/Scottcjn/ram-coffers).
 
+### Added
+- **Reduced Matrix Multiplication** (`ggml-rmm.h`, `docs/RMM.md`) — implementation of [arXiv:2608.13426](https://arxiv.org/abs/2608.13426) (Lan, Li, Zhou), which reduces each product `Y = A B` to the `ceil(ρ·d)` slices of the shared contraction axis with the largest activation column norms `‖A[:, j]‖₂`. Training-free, weight-preserving, deterministic, and re-decided per input/layer/head/decode step. Covers projections and FFN matrices (`rmm_project`, `rmm_project_gemv`) plus attention with `QKᵀ` feature reduction and optional `PV` token reduction (`rmm_attention`). Because a contraction-axis ratio is a *weight-row* ratio, only `ρ` of a coffer's bank is read — `rmm_prefetch_rows()` warms exactly the retained rows via `dcbt`. Scalar C11 path everywhere, VSX/AltiVec fast path on POWER8; `ρ = 1` is bit-identical to the dense kernel.
+- **RMM test suite and benchmark** (`tests/rmm_test.c`, root `Makefile`) — checks TopK determinism and tie resolution, bit-exact dense equivalence at `ρ = 1`, the paper's Proposition 1 error bound, activation-aware vs random selection at equal budget, the minimax selection claim, attention accuracy at `ρ_d = 0.5`, and MAC accounting. `make` runs it on x86-64 (1.75× on a 4096×4096 GEMV at `ρ_d = 0.5`, selection included); `make power8` builds the VSX path.
+
 ---
 
 ## [0.5.0] — 2026-05-18 — *Operability & DePIN positioning*
