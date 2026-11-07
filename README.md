@@ -765,7 +765,9 @@ The same POWER8 S824 that hits 147 t/s with RAM Coffers also mines RTC via Proof
 
 <div align="center">
 
-**[Elyan Labs](https://github.com/Scottcjn)** · [RustChain](https://rustchain.org) · [BoTTube](https://bottube.ai)
+**[Elyan Labs](https://elyanlabs.ai)** · [RustChain](https://rustchain.org) · [BoTTube](https://bottube.ai)
+
+If this project is useful to you, a ⭐ helps other people find it.
 
 </div>
 
