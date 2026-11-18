@@ -25,10 +25,31 @@ This document mixes two kinds of content, marked clearly throughout:
   run these specific invocations for this document; they're the documented
   procedure, not a result.
 
-## Hardware (as documented in this repo, note an unresolved inconsistency)
+## Hardware (two configurations, previously documented as one)
 
-The README describes the benchmark machine three different ways in three
-different places, and this document is not going to silently pick one:
+**Resolved 2026-09-21.** The figures below are not five competing claims about
+one machine — they are two configurations of the same machine, before and after a
+memory upgrade, quoted without labels:
+
+- **Pass 1** — 2 NUMA nodes, 128 GB + 192 GB = **320 GB**. This is the byline
+  figure and the configuration the Zenodo paper (Dec 2025) was written against.
+- **Pass 2** — 4 NUMA nodes, per-node capacities 193 + 183 + 119 + 62 = **557 GB**
+  addressable, 524 GB free when measured. Quoted elsewhere as "512 GB" (active)
+  and "768 GB" (installed).
+
+The per-node numbers corroborate each other: each Pass 2 capacity sits just above
+the free figure recorded for that same node (193/189, 183/178, 119/114, 62/43),
+which is one node set measured twice, not two different machines.
+
+Two caveats stand. The 557 GB sum of node capacities still does not equal the
+512 GB "active" figure, and that gap — LPAR active memory versus what each node
+reports — has not been resolved. And the machine was offline when this was
+written, so the reconciliation comes from Elyan Labs' dated records rather than a
+fresh `numactl --hardware`. Treat it as the documented history, not a live
+measurement.
+
+The original inventory of where each figure appears is kept below, because it is
+still the useful thing for anyone auditing the claims:
 
 | Location | RAM figure given |
 |---|---|
@@ -40,11 +61,12 @@ different places, and this document is not going to silently pick one:
 
 What's consistent across every source: **IBM POWER8 S824, dual 8-core POWER8
 CPUs (16 cores, SMT8 = 128 hardware threads), CPU-only inference, multi-NUMA
-Linux host.** The exact installed/active RAM capacity is documented
-inconsistently in this repo and should be confirmed against the actual machine
-(`lscpu`, `numactl --hardware`, or `free -g`) rather than trusted from any one
-line above. If you're the one running the reproduction, capture and report
-your own topology output rather than quoting one of these numbers.
+Linux host.** What varies is the memory configuration, and each row above now maps
+to a pass: the 320 GB byline to Pass 1, the 557 GB architecture table and the
+512/768 GB figures to Pass 2. The 557-vs-512 gap remains open. If you're the one
+running the reproduction, capture and report your own topology output
+(`lscpu`, `numactl --hardware`, `free -g`) rather than quoting any number from
+this repo — your own measurement is the only one that describes your machine.
 
 ## Model and quantization (MEASURED)
 
