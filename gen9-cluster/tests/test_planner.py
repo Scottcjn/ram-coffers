@@ -4,8 +4,11 @@ import dataclasses
 import unittest
 
 from gen9_cluster.hardware import GB, ConsoleUnit, Downbin, Runtime
-from gen9_cluster.model import DEEPSEEK_TINY, DEEPSEEK_V4_PRO
-from gen9_cluster.planner import PlanningError, describe_plan, plan_split
+from gen9_cluster.inventory import deployment_config
+from gen9_cluster.model import (DEEPSEEK_TINY, DEEPSEEK_V4_1_FLASH,
+                                DEEPSEEK_V4_PRO)
+from gen9_cluster.planner import (DEFAULT_HOP_SECONDS, PlanningError,
+                                  _estimate_decode, describe_plan, plan_split)
 
 #: A hypothetical unpublished model, for the paths that have to keep warning
 #: about extrapolated configurations now that both V4 profiles are published.
@@ -126,6 +129,166 @@ class TestPlacement(unittest.TestCase):
             self.assertEqual(sorted(host.hot_layers + host.dense_layers),
                              sorted(stage.layers))
             self.assertGreater(host.kv_bytes, 0)
+
+    def test_engram_tables_sit_on_their_stage_host_nvme(self):
+        """CSA2's conditional-memory tables are NVMe residents by design, and
+        they belong to the shelf whose host runs their layer — a lookup must
+        not cross a shelf boundary ahead of the layer that needs it."""
+        plan = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(60))
+        host_by_layer = {}
+        for stage in plan.stages:
+            for layer in stage.layers:
+                host_by_layer[layer] = stage.host_unit
+        for layer in DEEPSEEK_V4_1_FLASH.engram.layer_ids:
+            host = plan.units[host_by_layer[layer]]
+            self.assertIn(f"engram-{layer}@ssd", host.io_pieces)
+            # ...while the every-token fusion projection sits in its RAM
+            self.assertIn(f"engram-{layer}-fuse", host.io_pieces)
+
+    def test_a_no_ssd_plan_shards_engram_across_ram(self):
+        """With no drive to use, a hash-addressed table can still live in the
+        fleet's RAM — split across units exactly like routed experts are."""
+        plan = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(160),
+                          allow_ssd_tier=False)
+        engram = DEEPSEEK_V4_1_FLASH.engram
+        quant = DEEPSEEK_V4_1_FLASH.weights
+        for table, layer in enumerate(engram.layer_ids):
+            want = engram.table_row_bytes(table, quant)
+            held = sum(u.engram_rows.get(layer, 0) for u in plan.units.values())
+            self.assertEqual(held, want)
+            self.assertFalse(any(f"engram-{layer}@ssd" in u.io_pieces
+                                 for u in plan.units.values()))
+        nodes = deployment_config(plan, [])["nodes"]
+        config_rows = sum(node["engram_ram_bytes"] for node in nodes.values())
+        plan_rows = sum(sum(u.engram_rows.values())
+                        for u in plan.units.values())
+        self.assertEqual(config_rows, plan_rows)
+
+    def test_the_row_map_is_serialized_for_routing(self):
+        """A lookup routes by row id, so the deployment config has to carry
+        each unit's contiguous range — without it a --no-ssd deploy has the
+        rows but no map of where they went."""
+        plan = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(160),
+                          allow_ssd_tier=False)
+        engram = DEEPSEEK_V4_1_FLASH.engram
+        nodes = deployment_config(plan, [])["nodes"]
+        for table, layer in enumerate(engram.layer_ids):
+            records = sorted(
+                (dict(s, unit_id=uid) for uid, node in nodes.items()
+                 for s in node["engram_shards"] if s["layer"] == layer),
+                key=lambda s: s["first_row"])
+            self.assertTrue(records)
+            self.assertTrue(all(s["tier"] == "ram" for s in records))
+            # The ranges tile the whole table with no gaps and no overlap.
+            self.assertEqual(records[0]["first_row"], 0)
+            self.assertEqual(
+                sum(s["n_rows"] for s in records),
+                engram.num_embeddings[table])
+            for left, right in zip(records, records[1:]):
+                self.assertEqual(right["first_row"],
+                                 left["first_row"] + left["n_rows"])
+            self.assertEqual(
+                sum(s["bytes"] for s in records),
+                engram.table_row_bytes(table, DEEPSEEK_V4_1_FLASH.weights))
+            # The records are the accounting: per-unit shard bytes equal the
+            # RAM bytes the unit reports for that layer.
+            for s in records:
+                self.assertEqual(
+                    s["bytes"],
+                    plan.units[s["unit_id"]].engram_rows[layer])
+
+    def test_an_nvme_table_is_one_whole_shard_record(self):
+        """Same routing map, degenerate case: with a drive to use, a table is
+        a single record naming its holder and the whole row range."""
+        plan = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(60))
+        engram = DEEPSEEK_V4_1_FLASH.engram
+        nodes = deployment_config(plan, [])["nodes"]
+        for table, layer in enumerate(engram.layer_ids):
+            records = [s for node in nodes.values()
+                       for s in node["engram_shards"] if s["layer"] == layer]
+            self.assertEqual(len(records), 1)
+            record = records[0]
+            self.assertEqual(record["tier"], "ssd")
+            self.assertEqual(record["first_row"], 0)
+            self.assertEqual(record["n_rows"], engram.num_embeddings[table])
+
+    def test_ram_sharded_engram_counts_its_holders_per_token(self):
+        """A RAM-sharded lookup fans out to every holder, so the per-token
+        console count has to include them — hash addressing means the rows a
+        token needs live everywhere the table does."""
+        sharded = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(160),
+                             allow_ssd_tier=False)
+        engram = DEEPSEEK_V4_1_FLASH.engram
+        max_holders = max(
+            sum(1 for u in sharded.units.values() if layer in u.engram_rows)
+            for layer in engram.layer_ids)
+        self.assertGreaterEqual(sharded.active_units_per_token, max_holders)
+
+    def test_a_tiny_no_ssd_fleet_still_cannot_hold_v41(self):
+        """Sharding needs RAM to shard into — a fleet without the ~183 GiB of
+        headroom the tables need refuses rather than drop rows."""
+        with self.assertRaises(PlanningError):
+            plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(30),
+                       allow_ssd_tier=False)
+
+    def test_the_vision_tower_sits_where_images_enter(self):
+        """The vision encoder produces embeddings consumed at the front of the
+        pipeline, so it rides the first stage's host, not wherever headroom
+        happens to be."""
+        plan = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(60))
+        first_host = plan.units[plan.stages[0].host_unit]
+        self.assertIn("vision-encoder", first_host.io_pieces)
+
+    def test_engram_reads_are_priced_into_decode(self):
+        """A plan that carries the tables is slower than the same fleet
+        without them: row lookups off NVMe plus the fusion read are part of
+        every token's cost, not free."""
+        with_tables = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(60))
+        without = plan_split(dataclasses.replace(DEEPSEEK_V4_1_FLASH,
+                                                 engram=None), ps5_fleet(60))
+        self.assertGreater(with_tables.seconds_per_token,
+                           without.seconds_per_token)
+
+    def test_an_ssd_io_piece_is_priced_into_decode(self):
+        """An embedding or lm_head that spilled to NVMe is read once per
+        token — that streamed read (and the hop to its consumer) is part of
+        the decode estimate, not free."""
+        fleet = ps5_fleet(4)
+        caps = {u.unit_id: u.effective() for u in fleet}
+        plan = plan_split(DEEPSEEK_TINY, fleet)
+        base, _ = _estimate_decode(DEEPSEEK_TINY, caps, plan.units,
+                                   plan.stages, DEFAULT_HOP_SECONDS, 8192)
+        # The vision tower is per-image: spilling it must not change the
+        # per-token estimate, while embedding@ssd must.
+        holder = plan.units[fleet[-1].unit_id]
+        holder.io_pieces.append("vision-encoder@ssd")
+        vision, _ = _estimate_decode(DEEPSEEK_TINY, caps, plan.units,
+                                     plan.stages, DEFAULT_HOP_SECONDS, 8192)
+        self.assertEqual(vision, base)
+        holder.io_pieces.append("embedding@ssd")
+        with_ssd, _ = _estimate_decode(DEEPSEEK_TINY, caps, plan.units,
+                                       plan.stages, DEFAULT_HOP_SECONDS,
+                                       8192)
+        self.assertGreater(with_ssd, base)
+
+    def test_decoder_stage_hosts_hold_little_growing_cache(self):
+        """Only the source layers' hosts see a cache that grows with context —
+        a host of pure Reuse layers is almost cache-free, which is the CED
+        split's whole residency consequence."""
+        plan = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(60),
+                          context_tokens=1_000_000)
+        attention = DEEPSEEK_V4_1_FLASH.attention
+        sources = (set(attention.kv_source_layers)
+                   | set(attention.index_source_layers))
+        source_hosts = {stage.host_unit for stage in plan.stages
+                        if any(layer in sources for layer in stage.layers)}
+        for stage in plan.stages:
+            host = plan.units[stage.host_unit]
+            if stage.host_unit in source_hosts:
+                # ~36 B/token for a decoder index stream, ~144 B for a main one
+                self.assertGreater(host.kv_bytes, 50 * 1024 * 1024)
+            else:
+                self.assertLess(host.kv_bytes, 10 * 1024 * 1024)
 
     def test_a_devmode_xbox_is_not_asked_to_hold_more_than_its_sandbox(self):
         fleet = ps5_fleet(3) + [ConsoleUnit("xsx-dev", "xbox-series-x",

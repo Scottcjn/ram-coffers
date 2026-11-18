@@ -1,9 +1,12 @@
 """Model sizing: the arithmetic that decides how many consoles are needed."""
 
+import dataclasses
 import unittest
 
-from gen9_cluster.model import (DEEPSEEK_TINY, DEEPSEEK_V3, DEEPSEEK_V4_FLASH,
-                                DEEPSEEK_V4_PRO, MXFP4, PROFILES, profile_for)
+from gen9_cluster.model import (DEEPSEEK_TINY, DEEPSEEK_V3, DEEPSEEK_V4_1_FLASH,
+                                DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO,
+                                FP4_E4M3_16, FP8_UE8M0_32, MXFP4, PROFILES,
+                                profile_for)
 
 GB = 1024 ** 3
 MB = 1024 ** 2
@@ -167,6 +170,176 @@ class TestHybridAttention(unittest.TestCase):
         self.assertLess(v4 / v3, 0.15)
 
 
+class TestV41FlashAgainstPublishedFigures(unittest.TestCase):
+    """V4.1-Flash is a different architecture, not a V4 variant: a causal
+    encoder-decoder with shared KV pools, Engram memory, and DSpark drafts.
+    The published numbers it has to land on are 552 B backbone, 16 B
+    activated, ~196 B of Engram, and ~890 B of KV per token."""
+
+    def test_backbone_matches_the_published_552b(self):
+        """The card's 552 B excludes the draft blocks and the auxiliary
+        stores; so does total_params with include_mtp off."""
+        self.assertAlmostEqual(
+            DEEPSEEK_V4_1_FLASH.total_params(include_mtp=False) / 1e9,
+            552.0, delta=4.0)
+        self.assertGreater(DEEPSEEK_V4_1_FLASH.total_params(), 552e9)
+
+    def test_activated_matches_the_published_16b_decode(self):
+        """The card splits activation by phase: 8 B on prefill, 16 B on
+        decode. The planner's figure counts every block a decode token
+        touches, so it is the decode number it must match."""
+        self.assertAlmostEqual(DEEPSEEK_V4_1_FLASH.activated_params() / 1e9,
+                               16.0, delta=1.5)
+
+    def test_engram_tables_match_the_published_196b(self):
+        engram = DEEPSEEK_V4_1_FLASH.engram
+        self.assertIsNotNone(engram)
+        self.assertAlmostEqual(
+            engram.params(DEEPSEEK_V4_1_FLASH.hidden_size) / 1e9, 196.0,
+            delta=3.0)
+
+    def test_global_kv_cache_is_about_890_bytes_per_token(self):
+        """Four main-KV streams and eight indexer streams, all FP4 at m=2.
+        The derivation reads 864; the card claims ~890 — inside 4%, which is
+        the tolerance the whole figure is quoted to."""
+        per_token = sum(
+            DEEPSEEK_V4_1_FLASH.attention.kv_cache_bytes_per_token(layer=layer)
+            for layer in range(DEEPSEEK_V4_1_FLASH.planning_layers))
+        self.assertAlmostEqual(per_token / 890.0, 1.0, delta=0.04)
+
+    def test_the_cache_is_a_quarter_of_v4_flashs(self):
+        """The paper's headline claim for the architecture change."""
+        v4 = DEEPSEEK_V4_FLASH.kv_cache_bytes(1_000_000)
+        v41 = DEEPSEEK_V4_1_FLASH.kv_cache_bytes(1_000_000)
+        self.assertLess(v41 / v4, 0.30)
+
+    def test_not_flagged_as_assumed(self):
+        self.assertFalse(DEEPSEEK_V4_1_FLASH.assumed)
+        self.assertIn("config.json", DEEPSEEK_V4_1_FLASH.source)
+
+    def test_weights_are_fp8_32x32_and_experts_fp4(self):
+        self.assertTrue(DEEPSEEK_V4_1_FLASH.mixed_precision)
+        self.assertEqual(DEEPSEEK_V4_1_FLASH.weights, FP8_UE8M0_32)
+        self.assertEqual(DEEPSEEK_V4_1_FLASH.expert_quant, MXFP4)
+        self.assertAlmostEqual(FP8_UE8M0_32.bytes_per_param,
+                               1.0 + 1.0 / 1024, places=6)
+        self.assertAlmostEqual(FP4_E4M3_16.bytes_per_param, 0.5625, places=6)
+
+
+class TestCSA2LayerModes(unittest.TestCase):
+    """The schedule the checkpoint ships: two SWA prologue blocks, Full
+    source layers at 2/8/14/20, decoder Reindex layers every four blocks,
+    Reuse everywhere else, and SWA draft blocks at the tail."""
+
+    def test_schedule_covers_every_block_including_drafts(self):
+        attention = DEEPSEEK_V4_1_FLASH.attention
+        self.assertEqual(len(attention.compress_ratios),
+                         DEEPSEEK_V4_1_FLASH.planning_layers)
+        self.assertEqual(DEEPSEEK_V4_1_FLASH.planning_layers, 43)
+
+    def test_the_mode_layout(self):
+        kinds = [DEEPSEEK_V4_1_FLASH.attention.kind(i) for i in range(43)]
+        self.assertEqual(kinds[0:2], ["swa", "swa"])
+        for full in (2, 8, 14, 20):
+            self.assertEqual(kinds[full], "full", f"layer {full}")
+        for reindex in (24, 28, 32, 36):
+            self.assertEqual(kinds[reindex], "reindex", f"layer {reindex}")
+        self.assertEqual(kinds[40:], ["swa"] * 3)
+        self.assertEqual(kinds.count("reuse"), 30)
+
+    def test_only_source_layers_grow_the_cache(self):
+        """Under CSA2 most layers store nothing: the growing cache belongs to
+        the eight source streams, so a decoder shelf host holds a window and
+        little else."""
+        attention = DEEPSEEK_V4_1_FLASH.attention
+        for layer in range(43):
+            per_token = attention.kv_cache_bytes_per_token(layer=layer)
+            if layer in attention.kv_source_layers \
+                    or layer in attention.index_source_layers:
+                self.assertGreater(per_token, 0, f"layer {layer}")
+            else:
+                self.assertEqual(per_token, 0, f"layer {layer}")
+
+    def test_decoder_reindex_scan_is_bounded_by_the_candidate_pool(self):
+        """The hierarchical indexer is the reason a million-token decode does
+        not scan a million entries: past the pool size the read stops growing
+        with context."""
+        pool_entries = (DEEPSEEK_V4_1_FLASH.attention.candidate_topk_blocks
+                        * DEEPSEEK_V4_1_FLASH.attention.candidate_block_size)
+        shallow = DEEPSEEK_V4_1_FLASH.kv_read_bytes_for_layer(24, 4 * 32768)
+        deep = DEEPSEEK_V4_1_FLASH.kv_read_bytes_for_layer(24, 1_000_000)
+        self.assertEqual(shallow, deep)
+        # and a Full layer keeps scanning its whole stream
+        full_shallow = DEEPSEEK_V4_1_FLASH.kv_read_bytes_for_layer(2, 65536)
+        full_deep = DEEPSEEK_V4_1_FLASH.kv_read_bytes_for_layer(2, 1_000_000)
+        self.assertGreater(full_deep, full_shallow * 4)
+        self.assertGreater(pool_entries, 0)
+
+    def test_reuse_layers_read_only_the_selection(self):
+        """A Reuse layer performs no scan of its own; at long context it
+        reads far less than a Full layer."""
+        reuse = DEEPSEEK_V4_1_FLASH.kv_read_bytes_for_layer(30, 1_000_000)
+        full = DEEPSEEK_V4_1_FLASH.kv_read_bytes_for_layer(2, 1_000_000)
+        self.assertLess(reuse * 4, full)
+
+    def test_candidate_source_layer_gates_the_bounded_scan(self):
+        """The candidate pool exists only once the first decoder layer's Full
+        pass has built it: a Reindex layer below ``candidate_source_layer``
+        scans its own stream, so moving the boundary un-bounds the scan."""
+        attention = DEEPSEEK_V4_1_FLASH.attention
+        self.assertGreaterEqual(24, attention.candidate_source_layer)
+        shifted = dataclasses.replace(attention, candidate_source_layer=40)
+        bounded = attention.kv_read_bytes(1_000_000, layer=24)
+        unbounded = shifted.kv_read_bytes(1_000_000, layer=24)
+        self.assertGreater(unbounded, bounded * 4)
+
+    def test_engram_splits_into_nvme_rows_and_a_ram_projection(self):
+        """The planner prices the two parts of a table separately: the row
+        store (a drive resident) and the fusion projection (a RAM piece read
+        every token)."""
+        engram = DEEPSEEK_V4_1_FLASH.engram
+        for table in range(len(engram.layer_ids)):
+            whole = engram.table_bytes(table, DEEPSEEK_V4_1_FLASH.hidden_size,
+                                       DEEPSEEK_V4_1_FLASH.weights)
+            rows = engram.table_row_bytes(table, DEEPSEEK_V4_1_FLASH.weights)
+            fuse = engram.fusion_bytes(DEEPSEEK_V4_1_FLASH.hidden_size,
+                                       DEEPSEEK_V4_1_FLASH.weights)
+            self.assertEqual(rows + fuse, whole)
+            self.assertGreater(rows, 50 * GB)
+            self.assertLess(fuse, 64 * MB)
+
+
+class TestV41DraftAndAuxiliary(unittest.TestCase):
+    def test_draft_blocks_use_their_own_moe(self):
+        """DSpark drafts are 128-expert top-3 blocks, not shrunken copies of
+        the backbone's 384-expert top-6 MoE."""
+        draft = DEEPSEEK_V4_1_FLASH.moe_for_block(40)
+        self.assertEqual(draft.n_routed_experts, 128)
+        self.assertEqual(draft.top_k, 3)
+        backbone = DEEPSEEK_V4_1_FLASH.moe_for_block(39)
+        self.assertEqual(backbone.n_routed_experts, 384)
+        self.assertEqual(
+            DEEPSEEK_V4_1_FLASH.cold_bytes_per_moe_layer(40)
+            / DEEPSEEK_V4_1_FLASH.cold_bytes_per_moe_layer(39),
+            128 / 384)
+
+    def test_engram_reads_are_lookup_sized(self):
+        """Kilobytes per token is what makes a 183 GiB table an NVMe
+        resident rather than a refusal."""
+        engram = DEEPSEEK_V4_1_FLASH.engram
+        self.assertLess(engram.read_bytes_per_token(
+            DEEPSEEK_V4_1_FLASH.weights), 64 * 1024)
+        self.assertGreater(DEEPSEEK_V4_1_FLASH.engram_bytes(), 150 * GB)
+
+    def test_auxiliary_stores_count_toward_total_bytes(self):
+        """The fleet stores the Engram tables and the vision tower too, so
+        they are in total_bytes even though they are not in the card's
+        backbone parameter count."""
+        total = DEEPSEEK_V4_1_FLASH.total_bytes()
+        self.assertGreater(total, DEEPSEEK_V4_1_FLASH.engram_bytes())
+        self.assertGreater(DEEPSEEK_V4_1_FLASH.vision_bytes(), 0)
+
+
 class TestHyperConnections(unittest.TestCase):
     def test_a_shelf_hop_carries_the_whole_residual_stream(self):
         """mHC widens the residual to 4x hidden. The layer input stays hidden-
@@ -200,6 +373,7 @@ class TestProfileRegistry(unittest.TestCase):
         self.assertIs(profile_for("deepseek-v3"), DEEPSEEK_V3)
         self.assertIs(profile_for("deepseek-v4-pro"), DEEPSEEK_V4_PRO)
         self.assertIs(profile_for("deepseek-v4-flash"), DEEPSEEK_V4_FLASH)
+        self.assertIs(profile_for("deepseek-v4.1-flash"), DEEPSEEK_V4_1_FLASH)
 
     def test_unknown_names_say_what_is_available(self):
         with self.assertRaises(KeyError) as caught:
