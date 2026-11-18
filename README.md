@@ -203,11 +203,34 @@ Requires `-mcrypto` for `__builtin_crypto_vcipher()` / `__builtin_crypto_vcipher
 | **`vcipher-flash-attn-patch.c`** | **Flash attention inner loop patch (ops.cpp reference)** |
 | **`bench_vcipher_collapse.c`** | **Benchmark: vcipher vs vec_perm collapse** |
 | `pse-entropy-burst.h` | Hardware entropy injection via PowerPC timebase |
+| `ggml-rmm.h` | Reduced Matrix Multiplication — input-adaptive contraction-axis reduction (arXiv:2608.13426) |
 | `power8-compat.h` | POWER9→POWER8 intrinsic compatibility layer |
 | `ggml-neuromorphic-coffers.h` | Brain hemisphere → NUMA cognitive routing |
 | `ggml-symbolic-neural-bridge.h` | PowerLISP ↔ neural integration |
 | **`apple-silicon/`** | **Apple Silicon PSE port — NEON + AES + unified memory coffers** |
 | **`gen9-cluster/`** | **DeepSeek V4 Pro / Flash across PS5 / Xbox Series consoles — coffers as a fleet** |
+
+## Reduced Matrix Multiplication (NEW — August 2026)
+
+`ggml-rmm.h` implements [arXiv:2608.13426](https://arxiv.org/abs/2608.13426),
+*Reduced Matrix Multiplication* (Lan, Li, Zhou): every heavy product `Y = A B`
+keeps only the `ceil(ρ·d)` slices of the shared axis with the largest activation
+column norms, `‖A[:, j]‖₂`. Training-free, weight-preserving, deterministic, and
+re-decided per input, layer, head and decode step.
+
+It fits coffers because reducing the contraction axis reduces *rows of the weight
+matrix*: `X[:, I] W[I, :]` reads only `ρ` of a bank, so the FLOP saving lands as
+a bandwidth and page-residency saving. Unlike `ggml-topk-collapse-vsx.h`, which
+prunes attention scores after `QKᵀ` is paid for, RMM shrinks the multiply itself
+— the head dimension inside `QKᵀ` and optionally the token axis inside `PV`.
+
+```bash
+make         # scalar path + self-tests/benchmark
+make power8  # VSX path (-mcpu=power8 -maltivec -mvsx)
+```
+
+`ρ = 1` is bit-identical to the dense kernel. See [`docs/RMM.md`](docs/RMM.md)
+for the API, the error bound, and the attention/GQA rules.
 
 ## Ninth-Generation Console Cluster (NEW — August 2026)
 
