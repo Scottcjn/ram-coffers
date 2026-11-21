@@ -1,0 +1,21 @@
+name: Link Check
+
+on:
+  pull_request:
+    paths:
+      - "**.md"
+      - "docs/**"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  link-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check links with lychee
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --verbose --no-progress --exclude-mail --exclude "https://twitter.com/*" --exclude "https://x.com/*" --exclude "https://discord.gg/*" "./**/*.md"
+          fail: true
