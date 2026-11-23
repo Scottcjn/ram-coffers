@@ -11,6 +11,29 @@ RAM Coffers is LLM infrastructure for inference cost reduction: a NUMA-aware con
 
 See **[BENCHMARK.md](BENCHMARK.md)** for exactly what was measured, what's still template/unreproduced, and the commands to run this yourself.
 
+## Reproduce these numbers
+
+Source of everything below: [BENCHMARK.md](BENCHMARK.md), `benchmarks/BENCHMARK_REPORT.md` and `QUICK_START.md`. These are the author's self-reported results (Dec 16, 2025) from one machine; there are no raw `llama-bench` logs checked in (`benchmarks/out/` is gitignored) and nobody outside Elyan Labs has independently reproduced them.
+
+| Item | What is documented |
+|------|--------------------|
+| Hardware | IBM POWER8 S824, dual 8-core (16 cores, SMT8 = 128 threads), CPU-only, multi-NUMA Linux. RAM is documented inconsistently (320 GB / 512 GB / 768 GB in different places); capture your own `lscpu` and `numactl --hardware` |
+| OS | Not yet published for the headline run (the Ubuntu release of the benchmark host is not stated in this repo) |
+| Build flags | `cmake .. -DCMAKE_BUILD_TYPE=Release -DGGML_OPENMP=ON -DCMAKE_C_FLAGS="-mcpu=power8 -mvsx -maltivec -O3" -DCMAKE_CXX_FLAGS="-mcpu=power8 -mvsx -maltivec -O3"`, `make -j32` (GCC 10+), headers copied into `llama.cpp/ggml/src/ggml-cpu/arch/powerpc/` per [QUICK_START.md](QUICK_START.md) |
+| Model + quant | TinyLlama 1.1B Chat v1.0, Q4_K_M, `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf`, 638 MB (`TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF`) |
+| Command | `OMP_NUM_THREADS=64 OMP_PROC_BIND=spread OMP_PLACES=cores numactl --interleave=0,1 llama-bench -m tinyllama-1.1b-q4.gguf -t 64 -p 128 -n 32` |
+| Threads | 64 (documented as better than 128 on this machine; table in BENCHMARK.md) |
+| Result | pp128 147.54 t/s vs 16.74 t/s stock llama.cpp (8.81x); tg32 18.88 t/s. 147.54 is prompt-eval throughput, not decode |
+| Harness | `./benchmark_harness.sh` and `./benchmark_coffers_vs_llamacpp.sh --dry-run` write topology, env and raw logs to `benchmarks/out/` |
+
+Not yet published (gaps):
+
+- The source commit, exact CMake invocation and compiler version of the binary that produced 147.54 t/s (`build-pse-collapse`); the repo documents only the general build recipe
+- The stock llama.cpp commit used for the 16.74 t/s baseline
+- A single authoritative RAM figure and OS release for the benchmark host
+- Raw `llama-bench` logs for the headline run
+- `docs/BENCHMARK_RECIPE.md` describes a different machine (POWER8 S812L, LLaMA-2 7B) and does not match the measured setup above; treat BENCHMARK.md as authoritative until that file is reconciled
+
 **Author:** Scott Boudreaux
 **Date:** December 16, 2025
 **Institution:** Elyan Labs (Independent Research)
