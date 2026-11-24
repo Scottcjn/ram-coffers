@@ -44,8 +44,8 @@ Three properties make the fleet work anyway:
    tested against each other over all 256 codes.
 
 The result is a plan, not a benchmark: **~11.1 tok/s estimated** for V4 Pro at
-8k context on 170 consoles (100 PS5 + 40 Series X + 30 BC-250), and a **73-PS5
-floor** to hold it at all. V4 Flash is a fifth of the size and fits on **20**.
+8k context on 170 consoles (100 PS5 + 40 Series X + 30 BC-250), and an **83-PS5
+floor** to hold it RAM-only. V4 Flash is a fifth of the size and fits on **22**.
 Those figures are arithmetic over memory bandwidth, network hops, and NVMe
 reads. Nothing in this repository has run on a console yet.
 
@@ -53,14 +53,20 @@ reads. Nothing in this repository has run on a console yet.
 
 | profile | params | activated | on disk | PS5s to hold it |
 |---|---|---|---|---|
-| `deepseek-v4-pro` | 1599 B | 49 B | 802 GiB | 73 |
-| `deepseek-v4-flash` | 291 B | 13 B | 148 GiB | 20 |
+| `deepseek-v4-pro` | 1599 B | 49 B | 802 GiB | 83 |
+| `deepseek-v4-flash` | 291 B | 13 B | 148 GiB | 22 |
+| `deepseek-v4.1-flash` | 566 B + 197 B aux | 16 B (8 B prefill) | 468 GiB | 43 |
 | `deepseek-v3` | 683 B | 37 B | 638 GiB | 58 |
 | `deepseek-tiny` | — | — | 0.5 GiB | 1 (CI only) |
 
-Both V4 profiles are the published configurations, not extrapolations, and the
-tests check them against the published parameter counts. Two of their
-properties change how the planner thinks:
+All three V4-family profiles are the published configurations, not
+extrapolations, and the tests check them against the published parameter
+counts. V4.1's "aux" is the Engram tables and vision tower the card reports
+separately. Its RAM-only floor of **43** shards the ~183 GiB of Engram row
+stores across fleet memory — viable because a lookup is a deterministic hash,
+though every token then gathers rows over the network — and drops to **24**
+once the tables can sit on NVMe, which is where the design intends them. Two properties of the V4 architecture
+change how the planner thinks, and V4.1 adds a third row of its own below:
 
 - **Hybrid attention.** V4 alternates CSA (every 4 tokens compress to one
   entry, then attend sparsely to the best 1024 of them) with HCA (every 128
@@ -74,12 +80,33 @@ properties change how the planner thinks:
   ships 56 KiB per token rather than 14. At 250 µs a hop that is still small
   against a 90 ms token, but it is 4x what a V3-shaped model would cost.
 
+V4.1 is a different architecture, and it moves the split again:
+
+- **Causal encoder-decoder, shared KV pools.** Twenty encoder layers compress
+  the context; twenty decoder layers read a global cache projected from the
+  encoder instead of growing their own. CSA2 assigns each layer a static mode
+  — Full, Reindex, Reuse — so only the eight source streams store anything at
+  all: the growing cache concentrates on the four shelf hosts that own them
+  (864 B/token derived, ~890 published — a quarter of V4-Flash's), and a
+  decoder-stage host holds a sliding-window state and little else. Decoder
+  Reindex layers also scan only a 2048-block candidate pool, so their index
+  cost stops growing with context.
+- **Engram conditional memory.** Two hash-addressed n-gram tables, ~196 B
+  parameters at layers 1 and 14, read a few kilobytes per token. That is the
+  coldest weight class the model owns — deterministic addressing means the
+  rows are known before the layer runs — so each table goes straight to the
+  owning stage host's NVMe rather than competing for RAM.
+- **DSpark draft blocks.** Three next-token-prediction blocks at the tail,
+  with their own narrower MoE (128 experts, top-3) — the planner places them
+  like layers but sizes them by the draft config, not the backbone's.
+
 ## Quick start
 
 ```bash
 cd gen9-cluster
 python3 -m gen9_cluster model --model deepseek-v4-pro    # what it costs
 python3 -m gen9_cluster model --model deepseek-v4-flash  # the small one
+python3 -m gen9_cluster model --model deepseek-v4.1-flash # the new arch
 python3 -m gen9_cluster size  --model deepseek-v4-pro --ps5 100 \
         --xbox-series-x 40 --bc-250 30                   # how many consoles
 python3 -m gen9_cluster plan  fleet.json --config cluster.json
@@ -205,13 +232,16 @@ and coordinator paths over real loopback sockets.
 **Estimated**: every throughput figure for a console. They come from datasheet
 bandwidth, the fan-out and hop structure of the plan, and NVMe read rates.
 
-**Read off the model cards**: both V4 configurations. `deepseek-v4-pro` and
-`deepseek-v4-flash` are the published `config.json` files, checked in the tests
-against the published parameter counts (1.6 T / 49 B activated and 284 B / 13 B).
-An earlier revision of this stack extrapolated V4 Pro from V3 and was wrong in
-almost every field; the `assumed` flag and its `ASSUMED CONFIGURATION` stamp
-remain in the code for the next unpublished model, but no shipped profile sets
-it.
+**Read off the model cards**: all three V4-family configurations.
+`deepseek-v4-pro`, `deepseek-v4-flash`, and `deepseek-v4.1-flash` are the
+published `config.json` files, checked in the tests against the published
+parameter counts (1.6 T / 49 B activated, 284 B / 13 B, and 552 B backbone
+/ 16 B decode + ~196 B Engram). V4.1's per-layer weight terms are this
+repository's reading of the config — validated against the card's totals, not
+the sheet, the same standing the V4 readings have. An earlier revision of this
+stack extrapolated V4 Pro from V3 and was wrong in almost every field; the
+`assumed` flag and its `ASSUMED CONFIGURATION` stamp remain in the code for
+the next unpublished model, but no shipped profile sets it.
 
 **Interpreted, not published**: how those fields turn into bytes. The paper
 gives the architecture, not a storage layout, so the per-layer weight counts in
@@ -229,7 +259,7 @@ See [docs/GEN9_SPLITTING.md](docs/GEN9_SPLITTING.md) for the arithmetic and
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 159 tests
+python3 -m unittest discover -s tests -t .   # 232 tests
 cd kernels && make && make test              # CPU kernel + FP8 conformance
 make vulkan                                  # needs glslang-tools
 make hip                                     # needs hipcc; skipped otherwise

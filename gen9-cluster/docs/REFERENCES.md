@@ -24,6 +24,33 @@ What this design borrows, and from whom. Grouped by what it was borrowed *for*.
   pure sliding window. Earlier revisions of this stack extrapolated V4 Pro from
   V3 and were wrong in nearly every field; the profiles are no longer marked
   `assumed`, and the tests pin them to the cards' 1.6 T / 49 B and 284 B / 13 B.
+- **DeepSeek-V4.1-Flash model card.** DeepSeek-AI, 2026.
+  <https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash>.
+  The source of `DEEPSEEK_V4_1_FLASH`: a different architecture rather than a
+  V4 variant — a 20-layer causal encoder feeding a 20-layer decoder whose
+  global KV is projected from the encoder's output, CSA2's Full/Reindex/Reuse
+  layer modes sharing main-KV and indexer pools (`kv_source_layer_ids`,
+  `index_source_layer_ids`), a hierarchical indexer bounding later decoder
+  scans to a 2048-block candidate pool, FP4 (E2M1 + E4M3-per-16) KV cache, and
+  three DSpark draft blocks with their own 128-expert MoE. The mode schedule,
+  source-layer lists, and candidate-pool bounds are verbatim from
+  `config.json`; the per-layer weight terms in `CSA2Config.weight_params` are
+  this repository's reading, checked against the card's 552 B backbone /
+  16 B decode figures and ~890 B of KV per token.
+- **Engram: Conditional Memory via Scalable Lookup.** DeepSeek-AI, 2026.
+  <https://github.com/deepseek-ai/Engram>.
+  The conditional-memory primitive V4.1 embeds: O(1) hash-addressed n-gram
+  tables designed explicitly for offloading to host memory — which is why the
+  planner puts the tables on shelf-local NVMe by design rather than treating
+  them as overflow. V4.1's variant differs in shape (two ~98 B-parameter
+  tables, `engram_head_dim` 256, the compressed vocabulary) but the planning
+  argument — deterministic addresses, lookup-sized reads — is the paper's.
+- **DeepSelect.** DeepSeek-AI, 2026.
+  <https://github.com/deepseek-ai/DeepSelect>.
+  The reference TopK kernels for the sparse-attention indexer (top-k ≤ 4096
+  over bf16). CUDA, so it does not port to gfx1013 directly; it is cited here
+  because it documents what the indexer's selection step actually computes —
+  the operation `CSA2Config.kv_read_bytes` prices as a bounded scan.
 - **DeepSeek-V3 Technical Report.** DeepSeek-AI, 2024.
   [arXiv:2412.19437](https://arxiv.org/abs/2412.19437).
   MLA, DeepSeekMoE with fine-grained routed experts plus an always-on shared

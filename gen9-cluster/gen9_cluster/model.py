@@ -73,8 +73,15 @@ class QuantSpec:
 FP8_BLOCK128 = QuantSpec("fp8", scale_bytes=4.0, scale_block=128 * 128)
 #: FP8 E4M3 with a ue8m0 scale per 128x128 tile, as V4 ships it.
 FP8_UE8M0 = QuantSpec("fp8", scale_bytes=1.0, scale_block=128 * 128)
+#: FP8 E4M3 with a ue8m0 scale per 32x32 tile, as V4.1 ships it. Finer tiles
+#: are ~0.1% of scales rather than ~0.006% — still nothing next to the FP4
+#: experts.
+FP8_UE8M0_32 = QuantSpec("fp8", scale_bytes=1.0, scale_block=32 * 32)
 #: OCP MXFP4: E2M1 values with one E8M0 scale per 32-element tile.
 MXFP4 = QuantSpec("mxfp4", scale_bytes=1.0, scale_block=32)
+#: V4.1's KV-cache format: E2M1 values with one E4M3 scale per 16 channels.
+#: Not the OCP tile shape — 0.5625 bytes per cached element.
+FP4_E4M3_16 = QuantSpec("fp4", scale_bytes=1.0, scale_block=16)
 
 
 class AttentionConfig:
@@ -297,6 +304,273 @@ class HybridAttentionConfig(AttentionConfig):
 
 
 @dataclass(frozen=True)
+class CSA2Config(AttentionConfig):
+    """V4.1's CSA2 attention: static Full / Reindex / Reuse layers over shared
+    KV pools, inside a causal encoder-decoder stack.
+
+    V4 gave every layer its own compressed stream. CSA2 instead keeps a small
+    number of shared pools: a layer listed in ``kv_source_layers`` appends
+    main-KV entries to its stream, a layer in ``index_source_layers`` appends
+    indexer keys and computes its own top-k selection over the shared pool,
+    and every other compressed layer reuses the most recent selection and
+    stores nothing at all. The decoder's pool is *global*: its entries are
+    projected from the encoder's final hidden states rather than grown per
+    layer, which is why a decoder layer's ``compress_ratios`` entry reads 1 —
+    it never writes a stream of its own.
+
+    Two properties matter to the planner:
+
+    - The whole model's growing KV cache lives on the few shelf hosts that own
+      a source layer, not spread one stream per layer — at a million tokens
+      the derived figure is ~864 B/token against the card's ~890 (a ~3%
+      under-read this planner accepts; see the profile comment).
+    - Later decoder indexers are confined to the candidate pool built by
+      ``candidate_source_layer`` — ``candidate_topk_blocks`` x
+      ``candidate_block_size`` entries — so their scan cost is bounded
+      independently of context length, unlike an encoder-side scan.
+
+    ``compress_ratios`` is verbatim from the checkpoint, one entry per block
+    including the draft blocks: 0 marks a pure sliding-window block.
+    """
+
+    n_heads: int
+    #: ``c``: width of a shared KV entry, and of each query head.
+    head_dim: int
+    q_lora_rank: int
+    #: The output projection's per-group low-rank bottleneck.
+    o_lora_rank: int
+    o_groups: int
+    #: Partial RoPE: a subset of ``head_dim`` is rotated.
+    qk_rope_head_dim: int
+    index_n_heads: int
+    index_head_dim: int
+    index_topk: int
+    sliding_window: int
+    #: ``m``: every shared stream advances one entry per this many tokens.
+    csa_ratio: int
+    #: Per-block schedule, verbatim from ``compress_ratios``: ``csa_ratio`` for
+    #: encoder compressed layers, 1 for decoder layers (they write no stream),
+    #: 0 for pure sliding-window blocks including the DSpark draft blocks.
+    compress_ratios: Tuple[int, ...] = ()
+    #: Blocks that append main-KV entries to the shared pool (Full, when also
+    #: in ``index_source_layers``).
+    kv_source_layers: Tuple[int, ...] = ()
+    #: Blocks that append indexer keys and run their own selection.
+    index_source_layers: Tuple[int, ...] = ()
+    #: The first decoder layer, whose Full-mode pass builds the candidate pool
+    #: that later decoder indexers are restricted to. A Reindex layer below it
+    #: has no pool yet and scans its own stream like a Full layer does.
+    candidate_source_layer: int = 0
+    candidate_topk_blocks: int = 0
+    candidate_block_size: int = 0
+    #: Encoder/decoder boundary of the CED stack; blocks below this are the
+    #: causal encoder.
+    n_encoder_layers: int = 0
+    #: V4.1 caches the shared pools in FP4, not FP8.
+    kv_quant: QuantSpec = FP4_E4M3_16
+    index_quant: QuantSpec = FP4_E4M3_16
+
+    def ratio(self, layer: int = 0) -> int:
+        if not self.compress_ratios:
+            return self.csa_ratio
+        index = min(layer, len(self.compress_ratios) - 1)
+        return self.compress_ratios[index]
+
+    def kind(self, layer: int = 0) -> str:
+        if self.ratio(layer) == 0:
+            return "swa"
+        if layer in self.kv_source_layers:
+            return "full" if layer in self.index_source_layers else "kv-src"
+        if layer in self.index_source_layers:
+            return "reindex"
+        return "reuse"
+
+    def weight_params(self, hidden_size: int, layer: int = 0) -> int:
+        d, c, nh = hidden_size, self.head_dim, self.n_heads
+        # Queries: down to q_lora_rank, then up to one c-wide query per head.
+        q = d * self.q_lora_rank + self.q_lora_rank * nh * c
+        # The sliding-window branch exists on every block, including draft
+        # blocks and layers that otherwise share a pool.
+        kv_base = d * c
+        # Grouped low-rank output: heads collapse to o_lora_rank per group and
+        # each group projects back to d.
+        out = nh * c * self.o_lora_rank + self.o_groups * self.o_lora_rank * d
+        params = q + kv_base + out + self.q_lora_rank + c + nh
+        kind = self.kind(layer)
+        if kind in ("swa", "reuse"):
+            # Reuse layers produce no stream of their own: queries, the window
+            # branch, and the output projection are the whole block.
+            return params
+        # An indexer: queries off the q bottleneck, per-head weights off the
+        # hidden state, and its own compressor terms (same shape as V4's).
+        idx_c = self.index_head_dim
+        params += (self.q_lora_rank * self.index_n_heads * idx_c
+                   + d * self.index_n_heads
+                   + 2 * d * idx_c + 2 * d * idx_c
+                   + self.csa_ratio * 2 * idx_c + idx_c)
+        if kind in ("full", "kv-src"):
+            # A main-KV producer adds the compression projections that fold
+            # every csa_ratio tokens into one pooled entry.
+            params += 2 * d * c + 2 * d * c + self.csa_ratio * 2 * c + c
+        return params
+
+    def kv_entry_bytes(self) -> float:
+        """Bytes of one pooled KV entry: FP4 end to end, RoPE dims included."""
+        return self.head_dim * self.kv_quant.bytes_per_param
+
+    def index_entry_bytes(self) -> float:
+        return self.index_head_dim * self.index_quant.bytes_per_param
+
+    def kv_cache_bytes_per_token(self, dtype: str = "fp4",
+                                 layer: int = 0) -> int:
+        """What one more token appends to this layer's streams — zero for the
+        many layers that only read a shared pool."""
+        stored = 0.0
+        if layer in self.kv_source_layers:
+            stored += self.kv_entry_bytes() / self.csa_ratio
+        if layer in self.index_source_layers:
+            stored += self.index_entry_bytes() / self.csa_ratio
+        return int(round(stored))
+
+    def state_bytes(self, dtype: str = "fp4", layer: int = 0) -> int:
+        """The sliding-window branch, which every block carries.
+
+        V4.1's bounded-replay rule rebuilds this window instead of persisting
+        it, but while a sequence is live the window still occupies the shelf
+        host — sizing is unchanged, eviction is what changed.
+        """
+        return int(round(self.sliding_window * self.kv_entry_bytes()))
+
+    def _index_scan_bytes(self, context_tokens: int, layer: int) -> float:
+        """What this layer's own selection costs, where it has one.
+
+        A Full layer scans its whole stream. A Reindex layer in the decoder
+        scans only the candidate pool — the hierarchical indexer's point is
+        that this stops growing with context — and an encoder Reindex layer,
+        had one existed in this schedule, scans its stream like a Full layer.
+        """
+        entries = context_tokens / self.csa_ratio
+        if (self.kind(layer) == "reindex"
+                and layer >= self.candidate_source_layer
+                and self.candidate_topk_blocks):
+            entries = min(entries,
+                          float(self.candidate_topk_blocks
+                                * self.candidate_block_size))
+        return entries * self.index_entry_bytes()
+
+    def kv_read_bytes(self, context_tokens: int, dtype: str = "fp4",
+                      layer: int = 0) -> int:
+        """Cache one decoded token reads — selected entries, plus this layer's
+        own index scan if it performs one."""
+        state = self.state_bytes(dtype, layer)
+        if self.kind(layer) == "swa":
+            return state
+        entries = context_tokens / self.csa_ratio
+        selected = min(entries, float(self.index_topk)) * self.kv_entry_bytes()
+        scan = 0.0
+        if self.kind(layer) in ("full", "reindex"):
+            scan = self._index_scan_bytes(context_tokens, layer)
+        return int(round(selected + scan + state))
+
+
+@dataclass(frozen=True)
+class EngramConfig:
+    """Conditional-memory n-gram tables (deepseek-ai/Engram, V4.1 variant).
+
+    A table is a hash-addressed store of ``head_dim``-wide rows: each token
+    looks up a handful of rows by n-gram and the result is fused into the
+    hidden state at ``layer_ids``. Deterministic addressing is the property
+    the planner cares about — the rows a token will touch are known *before*
+    the layer runs, so the table can live on the slowest tier that still
+    answers a lookup, which on this hardware is shelf-local NVMe. The tables
+    are the coldest weights the model owns: ~196 B parameters read a few
+    kilobytes at a time.
+    """
+
+    #: Blocks whose hidden state takes an Engram fusion.
+    layer_ids: Tuple[int, ...]
+    #: Rows per table, one entry per ``layer_ids`` element.
+    num_embeddings: Tuple[int, ...]
+    n_heads: int
+    head_dim: int
+    #: The n-gram hash space the rows are addressed from.
+    vocab_size: int
+    compressed_vocab_size: int
+    max_ngram_size: int
+
+    def table_params(self, table: int) -> int:
+        return self.num_embeddings[table] * self.head_dim
+
+    def params(self, hidden_size: int) -> int:
+        """Rows, plus a per-table fusion projection back into hidden."""
+        tables = sum(self.table_params(i)
+                     for i in range(len(self.num_embeddings)))
+        fuse = len(self.num_embeddings) * hidden_size * self.n_heads \
+            * self.head_dim
+        return tables + fuse
+
+    def total_bytes(self, hidden_size: int, quant: QuantSpec) -> int:
+        return int(round(self.params(hidden_size) * quant.bytes_per_param))
+
+    def table_row_bytes(self, table: int, quant: QuantSpec) -> int:
+        """The hash-addressed row store: the NVMe-resident part of a table."""
+        return int(round(self.table_params(table) * quant.bytes_per_param))
+
+    def row_unit_bytes(self, quant: QuantSpec) -> float:
+        """Bytes in one row — the unit a RAM shard map is cut in."""
+        return self.head_dim * quant.bytes_per_param
+
+    def fusion_bytes(self, hidden_size: int, quant: QuantSpec) -> int:
+        """The per-table projection back into hidden — read every token, so
+        it belongs in the stage host's RAM, not on the drive."""
+        return int(round(hidden_size * self.n_heads * self.head_dim
+                         * quant.bytes_per_param))
+
+    def table_bytes(self, table: int, hidden_size: int,
+                    quant: QuantSpec) -> int:
+        return (self.table_row_bytes(table, quant)
+                + self.fusion_bytes(hidden_size, quant))
+
+    def read_bytes_per_token(self, quant: QuantSpec) -> int:
+        """One token's lookup: at most one row per head per n-gram size —
+        kilobytes, which is why the tables can sit on NVMe at all."""
+        rows = self.n_heads * self.max_ngram_size
+        return int(round(rows * self.head_dim * quant.bytes_per_param))
+
+
+@dataclass(frozen=True)
+class VisionConfig:
+    """The vision tower of a multimodal checkpoint: a ViT plus projector.
+
+    Small, dense, and cold in the planning sense that matters — it runs once
+    per image, not once per token — so it is placed as a single piece like the
+    embedding tables rather than split like a decoder layer.
+    """
+
+    n_layers: int
+    hidden_size: int
+    n_heads: int
+    intermediate_size: int
+    patch_size: int
+    #: Pixel-unshuffle factor before the projector (3 means 3x3 patches merge).
+    downsample_ratio: int
+
+    def params(self, out_hidden_size: int) -> int:
+        h = self.hidden_size
+        per_layer = 4 * h * h + 2 * h * self.intermediate_size + 2 * h
+        patch_embed = 3 * self.patch_size * self.patch_size * h
+        # Two-layer projector: merged patches to model width, then model width
+        # to model width.
+        merged = h * self.downsample_ratio * self.downsample_ratio
+        projector = merged * out_hidden_size + out_hidden_size * out_hidden_size
+        return self.n_layers * per_layer + patch_embed + projector
+
+    def total_bytes(self, out_hidden_size: int, quant: QuantSpec) -> int:
+        return int(round(self.params(out_hidden_size)
+                         * quant.bytes_per_param))
+
+
+@dataclass(frozen=True)
 class MoEConfig:
     """DeepSeekMoE shape: many narrow routed experts plus shared experts."""
 
@@ -340,9 +614,19 @@ class ModelProfile:
     weights: QuantSpec = FP8_BLOCK128
     #: Format of the routed and shared expert weights, when it differs.
     expert_weights: Optional[QuantSpec] = None
-    #: Multi-token-prediction heads (V3 ships one). Each is a whole extra
-    #: decoder block plus a head, so it is placed like a layer, not folded in.
+    #: Multi-token-prediction heads (V3 ships one; V4.1 ships three DSpark
+    #: draft blocks). Each is a whole extra decoder block plus a head, so it
+    #: is placed like a layer, not folded in.
     n_mtp_heads: int = 1
+    #: The draft blocks' MoE when it differs from the backbone's — V4.1's
+    #: DSpark blocks route to a narrower expert set.
+    draft_moe: Optional[MoEConfig] = None
+    #: DSpark's Markov-rank projection width per draft block; 0 for plain MTP.
+    draft_markov_rank: int = 0
+    #: Conditional-memory tables, when the checkpoint has them (V4.1).
+    engram: Optional[EngramConfig] = None
+    #: The vision tower, when the checkpoint is multimodal (V4.1).
+    vision: Optional[VisionConfig] = None
     #: Hyper-connection expansion: the residual stream is this many times
     #: hidden-wide, which is what crosses a pipeline boundary.
     hc_mult: int = 1
@@ -384,13 +668,22 @@ class ModelProfile:
         """
         return self.n_layers + self.n_mtp_heads
 
-    def expert_bytes(self) -> int:
+    def moe_for_block(self, index: int) -> MoEConfig:
+        """The MoE governing block ``index``: the draft MoE for blocks past
+        ``n_layers`` when one is configured, else the backbone's."""
+        if index >= self.n_layers and self.draft_moe is not None:
+            return self.draft_moe
+        return self.moe
+
+    def expert_bytes(self, index: Optional[int] = None) -> int:
         """One routed expert, packed, block scales included."""
-        params = self.moe.expert_params() * self.hidden_size
+        moe = self.moe if index is None else self.moe_for_block(index)
+        params = moe.expert_params() * self.hidden_size
         return int(round(params * self.expert_quant.bytes_per_param))
 
-    def shared_expert_bytes(self) -> int:
-        return self.expert_bytes() * self.moe.n_shared_experts
+    def shared_expert_bytes(self, index: Optional[int] = None) -> int:
+        moe = self.moe if index is None else self.moe_for_block(index)
+        return self.expert_bytes(index) * moe.n_shared_experts
 
     def attention_bytes(self, layer: int = 0) -> int:
         params = self.attention.weight_params(self.hidden_size, layer)
@@ -435,9 +728,10 @@ class ModelProfile:
         return int(round(3 * self.hidden_size * DTYPE_BYTES["bf16"]
                          + hc_params * self.bytes_per_param))
 
-    def router_bytes(self) -> int:
+    def router_bytes(self, index: Optional[int] = None) -> int:
         """Router matrix; the bias/hash table is added per-layer."""
-        return int(round(self.hidden_size * self.moe.n_routed_experts
+        moe = self.moe if index is None else self.moe_for_block(index)
+        return int(round(self.hidden_size * moe.n_routed_experts
                          * self.bytes_per_param))
 
     def dense_mlp_bytes(self) -> int:
@@ -453,20 +747,22 @@ class ModelProfile:
         remainder.
         """
         norms = int(round(2 * self.hidden_size * DTYPE_BYTES["bf16"]))
+        moe = self.moe_for_block(layer)
         gate_extras = 0
-        if layer >= self.moe.n_dense_layers:
-            if layer < self.moe.n_hash_layers:
-                gate_extras = int(round(self.vocab_size * self.moe.top_k * 4))
+        if layer >= moe.n_dense_layers:
+            if layer < moe.n_hash_layers:
+                gate_extras = int(round(self.vocab_size * moe.top_k * 4))
             else:
-                gate_extras = int(round(self.moe.n_routed_experts
+                gate_extras = int(round(moe.n_routed_experts
                                         * self.bytes_per_param))
         hc = self._hc_bytes() if self.hc_mult > 1 else 0
-        return (self.attention_bytes(layer) + self.router_bytes()
-                + gate_extras + self.shared_expert_bytes()
+        return (self.attention_bytes(layer) + self.router_bytes(layer)
+                + gate_extras + self.shared_expert_bytes(layer)
                 + norms + hc)
 
-    def cold_bytes_per_moe_layer(self) -> int:
-        return self.expert_bytes() * self.moe.n_routed_experts
+    def cold_bytes_per_moe_layer(self, index: Optional[int] = None) -> int:
+        moe = self.moe if index is None else self.moe_for_block(index)
+        return self.expert_bytes(index) * moe.n_routed_experts
 
     def dense_layer_bytes(self, layer: int = 0) -> int:
         norms = int(round(2 * self.hidden_size * DTYPE_BYTES["bf16"]))
@@ -486,15 +782,20 @@ class ModelProfile:
                          * self.bytes_per_param))
 
     def mtp_hot_bytes(self, head: int = 0) -> int:
-        """Per-token weights of one MTP head: its hot block plus projection."""
+        """Per-token weights of one draft block: its hot block, projection,
+        and — for DSpark — the Markov-rank projection."""
+        dspark = int(round(self.draft_markov_rank * self.hidden_size
+                           * self.bytes_per_param))
         return (self.hot_bytes_per_moe_layer(self.n_layers + head)
-                + self.mtp_projection_bytes() + self._mtp_extra_bytes())
+                + self.mtp_projection_bytes() + self._mtp_extra_bytes()
+                + dspark)
 
     def mtp_bytes(self) -> int:
-        """All MTP heads, weights in full."""
+        """All draft blocks, weights in full."""
         if self.n_mtp_heads == 0:
             return 0
-        return sum(self.mtp_hot_bytes(head) + self.cold_bytes_per_moe_layer()
+        return sum(self.mtp_hot_bytes(head)
+                   + self.cold_bytes_per_moe_layer(self.n_layers + head)
                    for head in range(self.n_mtp_heads))
 
     def block_bytes(self, index: int) -> int:
@@ -505,48 +806,67 @@ class ModelProfile:
             return self.hot_bytes_per_moe_layer(index)
         return self.mtp_hot_bytes(index - self.n_layers)
 
+    def engram_bytes(self) -> int:
+        """All conditional-memory tables, packed at the weight format."""
+        if self.engram is None:
+            return 0
+        return self.engram.total_bytes(self.hidden_size, self.weights)
+
+    def vision_bytes(self) -> int:
+        if self.vision is None:
+            return 0
+        return self.vision.total_bytes(self.hidden_size, self.weights)
+
     def total_bytes(self) -> int:
+        """Everything the fleet has to store — backbone, draft blocks, Engram
+        tables, and the vision tower."""
         weights = (self.embedding_bytes() + self.lm_head_bytes()
-                   + self._final_head_bytes() + self.mtp_bytes())
+                   + self._final_head_bytes() + self.mtp_bytes()
+                   + self.engram_bytes() + self.vision_bytes())
         for index in range(self.n_layers):
             if index < self.moe.n_dense_layers:
                 weights += self.dense_layer_bytes(index)
             else:
                 weights += (self.hot_bytes_per_moe_layer(index)
-                            + self.cold_bytes_per_moe_layer())
+                            + self.cold_bytes_per_moe_layer(index))
         return weights
 
     def total_params(self, include_mtp: bool = True) -> int:
         """Parameter count, for checking a profile against a model card.
 
-        DeepSeek's published totals exclude the MTP head, so ``include_mtp``
-        has to be off to compare against a card and on to size a fleet, which
-        does have to store it.
+        Counts the backbone blocks plus, when ``include_mtp`` is on, the draft
+        blocks — matching the card convention of quoting the backbone and
+        leaving auxiliary stores (Engram tables, the vision tower) to their own
+        lines. DeepSeek's published totals exclude the MTP head, so
+        ``include_mtp`` has to be off to compare against a card and on to size
+        a fleet, which does have to store it.
         """
-        per_expert = self.moe.expert_params() * self.hidden_size
         params = 2 * self.vocab_size * self.hidden_size
         params += self._final_head_params()
         blocks = self.planning_layers if include_mtp else self.n_layers
         for index in range(blocks):
+            moe = self.moe_for_block(index)
+            per_expert = moe.expert_params() * self.hidden_size
             attn = self.attention.weight_params(self.hidden_size, index)
             params += attn
             # input and post-attention RMSNorms
             params += 2 * self.hidden_size
             if self.hc_mult > 1:
                 params += self._hc_params()
-            if index < self.moe.n_dense_layers:
-                params += self.moe.dense_mlp_params(self.hidden_size)
+            if index < moe.n_dense_layers and index < self.n_layers:
+                params += moe.dense_mlp_params(self.hidden_size)
                 continue
-            params += self.hidden_size * self.moe.n_routed_experts
-            if index < self.moe.n_hash_layers:
-                params += self.vocab_size * self.moe.top_k
+            params += self.hidden_size * moe.n_routed_experts
+            if index < moe.n_hash_layers:
+                params += self.vocab_size * moe.top_k
             else:
-                params += self.moe.n_routed_experts
-            params += per_expert * (self.moe.n_routed_experts
-                                    + self.moe.n_shared_experts)
+                params += moe.n_routed_experts
+            params += per_expert * (moe.n_routed_experts
+                                    + moe.n_shared_experts)
             if index >= self.n_layers:
                 params += 2 * self.hidden_size * self.hidden_size
                 params += self._mtp_extra_params()
+                params += self.draft_markov_rank * self.hidden_size
         return int(params)
 
     def activated_params(self) -> int:
@@ -706,6 +1026,62 @@ DEEPSEEK_V4_FLASH = ModelProfile(
     source="deepseek-ai/DeepSeek-V4-Flash config.json; arXiv:2606.19348 §4.2.1",
 )
 
+#: Per-block attention schedule of DeepSeek-V4.1-Flash, verbatim from the
+#: checkpoint's ``compress_ratios``: two sliding-window blocks, eighteen
+#: compressed encoder blocks at m=2, twenty decoder blocks that write no
+#: stream of their own (entry 1), then the three DSpark draft blocks.
+_V4_1_FLASH_RATIOS: Tuple[int, ...] = tuple(
+    [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0])
+
+#: DeepSeek-V4.1-Flash, from the published config: 552 B backbone
+#: / 16 B activated on decode (8 B on prefill — the CED split makes the
+#: decoder's cache come pre-built), plus ~196 B of Engram tables and the
+#: vision tower that the card reports separately. 40 layers as a 20-layer
+#: causal encoder + 20-layer decoder, hidden 5120, all-MoE with 384 routed +
+#: 1 shared expert, top-6, CSA2 attention whose whole growing KV cache lives
+#: on the few source layers (4 main-KV streams + 8 indexer streams, all
+#: FP4 at m=2 — 864 B/token derived vs the card's ~890), three DSpark draft
+#: blocks with their own 128-expert top-3 MoE, hyper-connection width 4.
+#: Weights are FP8 at the finer 32x32 tile; experts stay MXFP4.
+DEEPSEEK_V4_1_FLASH = ModelProfile(
+    name="deepseek-v4.1-flash",
+    n_layers=40,
+    hidden_size=5120,
+    vocab_size=129280,
+    attention=CSA2Config(
+        n_heads=64, head_dim=512, q_lora_rank=1280,
+        o_lora_rank=1024, o_groups=8, qk_rope_head_dim=64,
+        index_n_heads=32, index_head_dim=128, index_topk=512,
+        sliding_window=128, csa_ratio=2,
+        compress_ratios=_V4_1_FLASH_RATIOS,
+        kv_source_layers=(2, 8, 14, 20),
+        index_source_layers=(2, 8, 14, 20, 24, 28, 32, 36),
+        candidate_source_layer=20,
+        candidate_topk_blocks=2048, candidate_block_size=8,
+        n_encoder_layers=20),
+    moe=MoEConfig(n_routed_experts=384, n_shared_experts=1, top_k=6,
+                  moe_intermediate_size=2304, n_dense_layers=0,
+                  dense_intermediate_size=0),
+    draft_moe=MoEConfig(n_routed_experts=128, n_shared_experts=1, top_k=3,
+                        moe_intermediate_size=2304, n_dense_layers=0,
+                        dense_intermediate_size=0),
+    draft_markov_rank=256,
+    engram=EngramConfig(
+        layer_ids=(1, 14),
+        num_embeddings=(384006168, 384016682),
+        n_heads=8, head_dim=256,
+        vocab_size=16000000, compressed_vocab_size=99092,
+        max_ngram_size=4),
+    vision=VisionConfig(n_layers=32, hidden_size=1024, n_heads=16,
+                        intermediate_size=2816, patch_size=14,
+                        downsample_ratio=3),
+    weights=FP8_UE8M0_32,
+    expert_weights=MXFP4,
+    n_mtp_heads=3,
+    hc_mult=4,
+    source="deepseek-ai/DeepSeek-V4.1-Flash config.json",
+)
+
 #: A small MoE with the same architecture, for a fleet of two or three consoles
 #: and for CI. Not a real checkpoint; a shape.
 DEEPSEEK_TINY = ModelProfile(
@@ -725,7 +1101,7 @@ DEEPSEEK_TINY = ModelProfile(
 
 PROFILES: Dict[str, ModelProfile] = {
     p.name: p for p in (DEEPSEEK_V3, DEEPSEEK_V4_PRO, DEEPSEEK_V4_FLASH,
-                        DEEPSEEK_TINY)
+                        DEEPSEEK_V4_1_FLASH, DEEPSEEK_TINY)
 }
 
 
@@ -751,10 +1127,15 @@ def describe(profile: ModelProfile) -> List[str]:
     fmt = profile.weights.dtype
     if profile.mixed_precision:
         fmt = f"{profile.expert_quant.dtype} experts / {fmt} elsewhere"
+    n_encoder = getattr(profile.attention, "n_encoder_layers", 0)
+    structure = f"{profile.n_layers}"
+    if n_encoder:
+        structure += (f" ({n_encoder} causal-encoder + "
+                      f"{profile.n_layers - n_encoder} decoder)")
     lines = [
         f"{profile.name}  ({fmt}"
         + (", ASSUMED CONFIGURATION" if profile.assumed else "") + ")",
-        f"  layers                {profile.n_layers} "
+        f"  layers                {structure} "
         f"({profile.moe.n_dense_layers} dense, {profile.n_moe_layers} MoE)",
         f"  attention             {_attention_summary(profile)}",
         f"  hidden                {profile.hidden_size}"
@@ -774,6 +1155,23 @@ def describe(profile: ModelProfile) -> List[str]:
         f"  KV cache @ 8k ctx     "
         f"{profile.kv_cache_bytes(8192) / mib:.0f} MiB",
     ]
+    if profile.draft_moe is not None:
+        lines.append(
+            f"  draft blocks          {profile.n_mtp_heads} "
+            f"({profile.draft_moe.n_routed_experts} experts, "
+            f"top-{profile.draft_moe.top_k})")
+    if profile.engram is not None:
+        lines.append(
+            f"  engram tables         "
+            f"{profile.engram.params(profile.hidden_size) / 1e9:.1f} B "
+            f"({profile.engram_bytes() / gib:.1f} GiB) at layers "
+            + ",".join(str(i) for i in profile.engram.layer_ids)
+            + " — hash-addressed, NVMe-tier by design")
+    if profile.vision is not None:
+        lines.append(
+            f"  vision tower          "
+            f"{profile.vision.params(profile.hidden_size) / 1e9:.2f} B "
+            f"({profile.vision_bytes() / mib:.0f} MiB), once per image")
     if profile.source:
         lines.append(f"  source                {profile.source}")
     if profile.assumed:
